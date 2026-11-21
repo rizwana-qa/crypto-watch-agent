@@ -358,6 +358,12 @@ HEAT_COLUMNS = [("Volatility", "volatility"), ("Vs 30-day<br>average", "distance
                 ("Volume<br>(context)", "volume"), ("Relative<br>strength<br>(context)", "strength")]
 
 
+# The cell colours. White cell text must keep a contrast of 4.5:1 or more on every colour between two stops (WCAG AA), so the amber and red
+# ends are the darker ones that the email already uses (emailbody.RANK_BG). tests/test_fix_heat_contrast.py checks every step of the scale.
+HEAT_TEXT = "#FFFFFF"
+HEAT_SCALE = ((0, "#161E2D"), (0.89, "#1E2838"), (0.9, "#8A6A1E"), (0.949, "#9A6414"), (0.95, "#C23B33"), (1, "#C93D35"))
+
+
 def rank_heatmap(data, ok):
     """Coins by measures. The colour shows how extreme the rank is: dark is ordinary, amber is 90 up to 95, red is 95 or higher.
     Relative strength can be unusual at either end, so its colour uses the distance from the middle and its text is the rank."""
@@ -368,9 +374,9 @@ def rank_heatmap(data, ok):
         values = [s["ranks"]["volatility"], s["ranks"]["distance"], s["ranks"]["drawdown"], ctx.get("volume_rank"), strength.get(c["coin"])]
         text.append(["n/a" if v is None else f"{v:.1f}" for v in values])
         z.append([None if v is None else (max(v, 100.0 - v) if i == 4 else v) for i, v in enumerate(values)])
-    scale = [[0, "#161E2D"], [0.89, "#1E2838"], [0.9, "#8A6A1E"], [0.949, "#B7791F"], [0.95, "#C23B33"], [1, "#E5483F"]]
+    scale = [list(stop) for stop in HEAT_SCALE]
     spec = {"type": "heatmap", "x": [name for name, _ in HEAT_COLUMNS], "y": [c["coin"] for c in ok], "z": z, "text": text,
-            "texttemplate": "%{text}", "textfont": {"size": 15, "color": "#FFFFFF"}, "zmin": 50, "zmax": 100, "colorscale": scale,
+            "texttemplate": "%{text}", "textfont": {"size": 15, "color": HEAT_TEXT}, "zmin": 50, "zmax": 100, "colorscale": scale,
             "showscale": False, "xgap": 4, "ygap": 4, "hovertemplate": "%{y}, %{x}: rank %{text}<extra></extra>"}
     line = {"type": "line", "xref": "x", "yref": "paper", "x0": 2.5, "x1": 2.5, "y0": 0, "y1": 1, "line": {"color": MUTED, "width": 1.5, "dash": "dot"}}
     notes = [{"x": 1, "y": 1.12, "xref": "x", "yref": "paper", "text": "Can raise an alert", "showarrow": False, "font": {"size": 12, "color": "#FF9C94"}},
