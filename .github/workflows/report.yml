@@ -1,7 +1,9 @@
 name: Executive report
 
-# Builds the executive intelligence brief right after a successful daily run, and emails it: one email per day, with a subject
-# written from the day's numbers. The email body is the brief itself, and the interactive page is attached.
+# Builds the executive intelligence brief right after the daily run, whether it passed or failed, and emails it: one email per day, with a
+# subject written from the day's numbers. A failed daily run (for example no Kraken data for any coin) still gets its email, which then says
+# the data is unavailable. A cancelled or skipped daily run does not start it. The email body is the brief itself, and the interactive page
+# is attached.
 # The last step checks the Ask page's playbook index. The Ask page itself runs on your own computer (start_ask_page.bat), so your
 # Groq key never leaves it.
 # It can also be started by hand from the Actions tab.
@@ -21,7 +23,7 @@ concurrency:
 jobs:
   report:
     name: Build the brief and email it
-    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' || github.event.workflow_run.conclusion == 'failure'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     env:
@@ -55,4 +57,5 @@ jobs:
       # The playbook is searched by the Ask page (python rag_server.py). This step proves the index still finds the right section for
       # every test question after today's code. No AI call and no key.
       - name: Check the Ask page's playbook index (no AI call)
+        if: ${{ !cancelled() }}
         run: python rag.py --check

@@ -1,8 +1,9 @@
 """Crypto Watch Agent: the AI recommends, the code checks, decides and acts.
 
 Run it:
-    python agent.py                                  one live run (Kraken + Groq + Google Sheet)
-    python agent.py --mode planner --reviewer on     another version of the agent
+    python agent.py                                  one live run (Kraken + Groq + Google Sheet); the code review always runs,
+                                                     and the AI also reviews a drafted alert
+    python agent.py --mode planner --reviewer off    another version; --reviewer off skips only the AI review call
     python agent.py --dry-run                        live data and AI, but nothing is posted to the Sheet
     python agent.py --test                           fake tools, real AI; exit code 1 if a scenario fails
     python agent.py --measure                        4 versions x 3 runs, prints the results table
@@ -19,6 +20,7 @@ import re
 import statistics
 import sys
 import time
+import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -47,10 +49,14 @@ ALERT_RANK = 95.0       # a rank at or above this is "unusual" (see playbook.md,
 UNUSUAL_LOW = 100.0 - ALERT_RANK  # two-sided context metrics: a rank at or below this (5) is unusually low
 
 DEFAULT_MODE = "agent"  # "agent" (tool loop) or "planner" (plan first, code runs the steps)
-USE_REVIEWER = False    # the reviewer switch; --reviewer on|off overrides it
+USE_REVIEWER = True     # the AI review switch; --reviewer on|off overrides it. It never turns the code review off: that always runs
 MAX_STEPS = 12          # agent loop: the most AI calls before the run stops with an error (8 before the two context tools; a model that calls one tool at a time needs 9 or more)
 MAX_FIX_ATTEMPTS = 2    # how often the AI may be asked again after an invalid answer
-MAX_REVISIONS = 1       # how often the agent may revise after the reviewer found problems
+MAX_REVISIONS = 1       # how often the agent may revise after the review found problems (a code finding or an AI rejection)
+REVIEW_MAX_TOKENS = 1000 # reply cap for the AI review call: a small JSON verdict. A reasoning model may spend part of the cap on thinking, so it is not set tight
+REVIEW_REASONING_EFFORT = "low"   # sent only with the review call and only to an openai/gpt-oss model (Groq documents low, medium and high for them): a verdict needs little thinking
+REVIEW_REQUEST_CAP = 3000  # the most the whole AI review request (system plus user) may be, in ESTIMATED tokens (characters / 4, not a Groq count); the free tier refuses one request that is too large
+MAX_REVIEW_LINE_CHARS = 200  # the short review status that goes into the Sheet's Review column
 MAX_PLAN_STEPS = 12     # planner: the most steps a plan may have (3 market + cross-asset + context + stats + history + playbook searches)
 TREND_LONG_DAYS = 60    # the longer of the two trend windows (the shorter one is WINDOW, 30 days)
 MAX_MESSAGE_CHARS = 280
@@ -65,8 +71,85 @@ BANNED_WORDS = [
     "recommendation", "advise", "advice", "take profit", "stop loss", "stop-loss",
 ]
 ADVICE_RE = re.compile(r"\b(?:" + "|".join(re.escape(w) for w in BANNED_WORDS) + r")\b", re.IGNORECASE)
+# Plain market terms and the disclaimer that hold a banned word but give no advice. Only these exact phrases are cut out
+# (whole phrase, any case) before has_advice_language() checks the text. Nothing else is let through.
+ADVICE_SAFE_PHRASES = ["sell-off", "selloff", "long-term", "short-term", "mid-term", "short squeeze", "holding steady",
+                       "not financial advice", "not investment advice", "not trading advice"]
+SAFE_PHRASE_RE = re.compile(r"\s*\b(?:" + "|".join(re.escape(p) for p in ADVICE_SAFE_PHRASES) + r")\b\s*", re.IGNORECASE)
+
+
+# Second layer (D-05): advice and forecasts written without a banned word ("add to their positions", "will likely rebound", "price target").
+# It only ever BLOCKS an alert, it never rewrites or adds anything, and it is narrow on purpose: every pattern needs a clear future or
+# instruction form, so a plain past-tense description ("BTC fell 8%", "volume was 2.4 times its average") never matches.
+# The playbook already says "no advice and no prediction"; this enforces the second half in code. A forecast can only be described as such
+# when the model writes one, so a miss costs nothing; a false block costs a missed alert, which is why tests/test_fix_d05_layer2.py holds a
+# large set of honest messages that must still pass.
+_MOVES = (r"(?:rise|rally|rebound|recover|crash|drop|fall|surge|moon|pump|dump|climb|soar|plunge|bounce|spike|tank|collapse|explode|"
+          r"break\s?out|reverse|double|triple|reach|hit|go\s+(?:up|down|higher|lower)|move\s+(?:up|down|higher|lower)|"
+          r"continue\s+(?:to\s+)?(?:rise|fall|climb|drop|rally|decline|higher|lower|up|down)|keep\s+(?:rising|falling|climbing|dropping))")
+_FUTURE = (r"(?:will|won't|going\s+to|gonna|expected\s+to|likely\s+to|probably\s+(?:will|to)|poised\s+to|bound\s+to|"
+           r"certain\s+to|sure\s+to|about\s+to)")
+_ADVICE_PATTERNS = [
+    # a forecast: a future or expectation word, up to two filler words, then a price move
+    rf"\b{_FUTURE}\s+(?:(?:likely|probably|soon|then|also|still|further|just|quickly|sharply|slowly|keep|continue)\s+){{0,2}}{_MOVES}\b",
+    r"\bexpect(?:s|ing)?\s+(?:\w+\s+){0,3}?(?:upside|downside|gains?|rally|rebound|recovery|bounce|pullback|correction|decline|drop|crash|"
+    r"breakout|reversal|surge|dip|continuation)\b",
+    r"\bprice\s+targets?\b|\btarget\s+price\b|\bprice\s+objective\b",
+    # a promise: "guaranteed", "risk free" (a plain "not guaranteed" disclaimer is cut out first)
+    r"\bguarantee[sd]?\b|\brisk[- ]free\b|\briskless\b|\bsure[- ]?(?:thing|fire)\b|\bcan(?:'t|not)\s+lose\b|\bno\s+risk\b|\beasy\s+money\b",
+    # advice written as a suggestion or a hint
+    r"\badd(?:ing)?\s+to\s+(?:(?:your|their|his|her|the|an?|existing)\s+)?(?:\w+\s+)?positions?\b",
+    r"\bload(?:ing)?\s+up\b",
+    r"\bget(?:ting)?\s+(?:in|out)\s+(?:now|here|early|before|while|fast|quickly|soon)\b|\bjump\s+in\s+(?:now|here|early|before|while)\b",
+    r"\bgo(?:ing)?\s+all[- ]in\b|\bdouble\s+down\b|\bcatch\s+the\s+(?:dip|falling\s+knife|wave|move)\b|\b(?:do\s+not|don'?t)\s+miss\b|\bfomo\b",
+    r"\bdiversif\w+\b|\brebalanc\w+\b|\bcut\s+(?:your\s+|their\s+)?losses\b",
+    r"\b(?:traders|investors|holders|readers|users|everyone|anyone)\s+(?:may|might|could|can|would|will)\s+(?:want|wish|consider|be\s+wise|do\s+well)\b",
+    r"\byou\s+(?:may|might|could|can|would|will)\s+(?:want|wish|consider|do\s+well)\b",
+    r"\b(?:consider|think\s+about)\s+(?:adding|reducing|trimming|increasing|decreasing|raising|lowering|cutting|closing|opening|entering|exiting|"
+    r"reallocating|rotating)\b",
+    r"\bwould\s+be\s+(?:wise|smart|prudent|sensible)\b",
+    r"\b(?:good|great|ideal|perfect|best|right|prime)\s+(?:moment|time|opportunity|chance|spot)\s+(?:to|for)\b",
+    r"\btime\s+to\s+(?:act|move|get|go|jump|enter|exit|close|add|trim|cut|reduce|increase|rotate|rebalance|reallocate|position)\b",
+    r"\b(?:opportunity|chance)\s+to\s+(?:add|enter|exit|trim|cut|reduce|increase|rotate|reallocate)\b",
+    r"\bwait(?:ing)?\s+for\s+(?:an?|the)\s+(?:\w+\s+)?(?:pullback|dip|retrace\w*|correction|breakout|confirmation|bounce|rebound|reversal)\b",
+    r"\b(?:use|exercise|take)\s+(?:extra\s+)?(?:caution|care)\b|\bproceed\s+with\s+caution\b|\bbe\s+(?:careful|cautious|wary|prepared|ready)\b|"
+    r"\bstay\s+(?:cautious|careful|vigilant|wary|safe)\b|\bwatch\s+out\b|\bdo\s+your\s+own\s+research\b|\bdyor\b",
+]
+ADVICE_PATTERN_RE = re.compile("|".join(f"(?:{p})" for p in _ADVICE_PATTERNS), re.IGNORECASE)
+# Plain disclaimers that hold a promise word but promise nothing. Cut out before the second layer only (never before the word list).
+ADVICE_DISCLAIMERS = ["not guaranteed", "no guarantee", "no guarantees", "not a guarantee", "cannot guarantee", "can't guarantee",
+                      "does not guarantee", "doesn't guarantee", "do not guarantee", "not a price target", "not price targets", "no price target"]
+DISCLAIMER_RE = re.compile(r"\s*\b(?:" + "|".join(re.escape(p) for p in ADVICE_DISCLAIMERS) + r")\b\s*", re.IGNORECASE)
+_HIDDEN_CHARS_RE = re.compile("[​‌‍⁠­﻿]")
+_SPACED_LETTERS_RE = re.compile(r"\b(?:[A-Za-z][\s.\-_*]){2,}[A-Za-z]\b")
+
+
+def plain_text(text):
+    """The text as a reader sees it: full-width and ligature letters become plain letters (NFKC), invisible characters are dropped and
+    letters spaced out one by one ('B U Y', 'b.u.y') are joined, so a word cannot be hidden from the check by its spelling."""
+    text = _HIDDEN_CHARS_RE.sub("", unicodedata.normalize("NFKC", str(text)))
+    return _SPACED_LETTERS_RE.sub(lambda match: re.sub(r"[\s.\-_*]", "", match.group(0)), text)
+
+
+def has_advice_language(text):
+    """True when the text has a banned word or one of the second-layer patterns. The text is first made plain (plain_text). The safe
+    phrases are cut out next, each replaced by one space (with the spaces around it), so a cut can never join two words, and a phrase
+    placed inside a banned phrase ('take sell-off profit') still shows up. The plain disclaimers are cut out only before the patterns."""
+    cut = SAFE_PHRASE_RE.sub(" ", plain_text(text))
+    if ADVICE_RE.search(cut):
+        return True
+    return bool(ADVICE_PATTERN_RE.search(DISCLAIMER_RE.sub(" ", cut)))
+
 
 MODEL = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
+# REVIEWER_MODEL (optional) names another Groq model for the AI review call only. A second model gives an independent opinion and has
+# its own free-tier token budget. When it is not set, the review uses MODEL, so nothing changes.
+
+
+def reviewer_model():
+    return os.environ.get("REVIEWER_MODEL", "").strip() or MODEL
+
+
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 KRAKEN_URL = "https://api.kraken.com/0/public/OHLC"
 PLAYBOOK_PATH = Path(__file__).with_name("playbook.md")
@@ -85,6 +168,10 @@ class ShapeError(ValueError):
 
 def log(message):
     print(message, flush=True)
+
+
+def utc_now():
+    return datetime.now(timezone.utc)
 
 
 def redact(text, *secrets):
@@ -111,12 +198,13 @@ CANDLE_TOLERANCE = 1e-9   # relative slack when one candle's own prices are comp
 
 
 def as_number(value):
-    """A finite float from a number or numeric text, else None. Booleans, NaN, infinity and words are refused."""
-    if isinstance(value, bool):
+    """A finite float from a number or numeric text, else None. Booleans, NaN, infinity, words and text that is not plain ASCII digits
+    ("1_000", full-width digits, Unicode spaces) are refused (D-15). Plain spaces around a number are still accepted."""
+    if isinstance(value, bool) or (isinstance(value, str) and not sources.NUMBER_TEXT_RE.match(value)):
         return None
     try:
         number = float(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):   # OverflowError: a JSON integer too large for a float
         return None
     return number if math.isfinite(number) else None
 
@@ -539,6 +627,7 @@ def deliver(decision, version):
         "sources": decision["sources"],
         "reasoning": decision["reasoning"],
         "blocked_reason": decision["blocked_reason"],
+        "review": review_line(decision),   # the short review status; an older web app ignores this field
     }
     body = sheet_post(payload)
     log(f"Delivered: row {body.get('row')}, email sent: {body.get('emailed')}")
@@ -841,14 +930,22 @@ Rules: at most %d steps; use only the tools below; every coin must be one of the
 Tools:
 %s"""
 
-REVIEW_PROMPT = """You review the draft decision of a crypto watch agent (education only). You see the evidence (everything the tools returned), the playbook and the draft.
-Check each point:
-1. Every number in the draft message and reasoning appears in the evidence.
-2. If alert is true: for each named coin the evidence shows that a playbook rule is met, and the sources contain that rule's section title.
-3. If alert is false: no coin meets an alert rule that has not already been alerted.
-4. The draft does not repeat an alert that the recent decisions already show.
-5. Nothing sounds like advice (buy, sell, long, short, hold, should, recommend).
-Reply with ONLY a JSON object: {"approved": true or false, "problems": ["short problem", ...]}. Approve when there is no problem."""
+# The AI review answers with codes from this closed list, so a verdict can be logged, counted and acted on without reading prose.
+REVIEW_CODES = {
+    "UNSUPPORTED_CLAIM": "the message or reasoning says something the digest does not show",
+    "WRONG_COIN": "a number or statement belongs to a different coin than the one it names",
+    "OVERSTATED": "the wording is stronger than the numbers (for example 'crash' for a small move)",
+    "CAUSE_NOT_IN_DATA": "it names a cause or reason that no data gives",
+    "ADVICE_OR_FORECAST": "it advises, predicts or tells anyone to act",
+    "MISSING_CAVEAT": "a source was unavailable or partial and the draft does not say so",
+    "OTHER": "any other problem against the playbook rules",
+}
+
+REVIEW_PROMPT = """You confirm the draft alert of a crypto watch agent (education only). You get the playbook rules that apply, a digest of the evidence (the alerted coins in full, the other coins in brief; what the tools returned) and the draft. The code has already checked the numbers, the wording words and the alert rank; you look for what code cannot check.
+Report a problem with one of these codes:
+%s
+Reply with ONLY a JSON object: {"approved": true or false, "codes": ["CODE"], "notes": ["one short sentence per code"]}. Approve (true, with empty lists) when none applies.""" % "\n".join(
+    f"- {code}: {meaning}" for code, meaning in REVIEW_CODES.items())
 
 
 def tool_list_text():
@@ -856,12 +953,17 @@ def tool_list_text():
                      for name, spec in TOOL_SPECS.items())
 
 
-def call_llm(messages, tools=None):
-    """One Groq chat call. Waits and retries on a rate limit. Returns the assistant message."""
+def call_llm(messages, tools=None, max_tokens=None, model=None):
+    """One Groq chat call. Waits and retries on a rate limit. Returns the assistant message.
+    max_tokens and model are optional and only the AI review call sets them; every other caller gets the defaults (no cap, MODEL)."""
     key = os.environ.get("GROQ_API_KEY", "")
     if not key:
         raise AgentError("GROQ_API_KEY is not set")
-    payload = {"model": MODEL, "messages": messages, "temperature": 0}
+    payload = {"model": model or MODEL, "messages": messages, "temperature": 0}
+    if max_tokens:
+        payload["max_tokens"] = max_tokens
+        if payload["model"].startswith("openai/gpt-oss"):
+            payload["reasoning_effort"] = REVIEW_REASONING_EFFORT
     if tools:
         payload.update(tools=tools, tool_choice="auto")
     for attempt in range(1, MAX_LLM_ATTEMPTS + 1):
@@ -890,7 +992,10 @@ def call_llm(messages, tools=None):
         used = usage.get("total_tokens") if isinstance(usage, dict) else None
         if isinstance(used, int) and not isinstance(used, bool) and used > 0:
             STATS["llm_tokens"] += used
-        return body["choices"][0]["message"]
+        message = body["choices"][0]["message"]
+        if body["choices"][0].get("finish_reason") == "length":
+            message = dict(message, finish_reason="length")   # the reply was cut off at max_tokens; only the AI review reads this
+        return message
     raise AgentError("Groq kept answering with a rate limit")
 
 
@@ -1046,7 +1151,13 @@ def run_planner(tools):
 
 
 # ==============================================================================================
-# 9. THE REVIEWER (reflection): a second pass over the draft, with a switch and a revision limit
+# 9. THE REVIEW STAGE. It runs on every run and always says what it did.
+#    The code review (eight checks, no tokens) runs every time. The AI review (one small call) runs only when an alert is
+#    drafted, because an alert is a claim and a calm day has nothing to confirm. --reviewer off skips only the AI call.
+#    A finding that the code can state as a fact goes straight to the one revision: the AI is never asked to review a draft that
+#    is already known to be wrong. Before the review, the code completes the evidence: it runs every data tool that the AI left out
+#    (complete_evidence), so what is reviewed and what is saved does not depend on which tools the AI chose to call.
+#    The AI review request is kept under a cap (REVIEW_REQUEST_CAP, an estimate) and is trimmed in a fixed order when it is over.
 # ==============================================================================================
 ALLOWED_NUMBERS = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 30, 31, 90, 95, 100, 280, 600}
 NUMBER_RE = re.compile(r"(?<![\w.])[-+]?\d[\d,]*\.?\d*")
@@ -1075,46 +1186,578 @@ def unsupported_numbers(text, evidence_json):
     return bad
 
 
-def review_draft(draft, evidence):
-    """One reviewer call. A broken reply or a failed call never blocks the job: the draft is kept."""
+def number_problem(numbers):
+    return ("numbers not in the evidence: " + ", ".join(dict.fromkeys(numbers)))[:200]
+
+
+# ---- R3: unsafe text. The check names the kind of text it found and never repeats the text, so its detail is safe to log.
+KEY_LIKE_RE = re.compile(r"\b(?:gsk|sk|ghp|gho|xox[abp])[-_][A-Za-z0-9_-]{8,}|\bAKIA[0-9A-Z]{12,}\b|[A-Za-z0-9+/=_-]{32,}|"
+                         r"\b(?:api[ _-]?key|secret|password|passwd|bearer)\b\s*[:=]|\bkey=", re.IGNORECASE)
+HYGIENE_PATTERNS = {
+    "a link": re.compile(r"https?:|\bwww\.|\]\(|\b[a-z0-9-]+\.(?:com|org|net|io|ai|app|dev|xyz|info|biz|ly|me)\b", re.IGNORECASE),
+    "markup or code": re.compile(r"</?[a-z][^<>]*>|`|~~~", re.IGNORECASE),
+    "key-like text": KEY_LIKE_RE,
+    "an instruction": re.compile(
+        r"\bignore\s+(?:(?:all|any|the|your|my|previous|prior|above|earlier)\s+){1,3}(?:instructions?|rules?|prompts?|messages?|guidelines?|directions?)\b|"
+        r"\bignore\s+(?:previous|prior|above|earlier)\b|\bdisregard\s+(?:all|any|the|your|previous|prior|above)\b|\bsystem\s+prompt\b|"
+        r"\byou\s+are\s+now\b|\bnew\s+instructions?\b|\bforget\s+(?:all|your|the|previous)\b|\breveal\s+(?:the|your)\b|\bjailbreak\b|"
+        r"\boverride\s+(?:the\s+|your\s+)?(?:rules|instructions|guardrails)\b", re.IGNORECASE),
+}
+
+
+def hygiene_kinds(text):
+    """The kinds of unsafe text in a string: a link, markup or code, key-like text, an instruction. Names only."""
+    plain = plain_text(text)
+    return [kind for kind, pattern in HYGIENE_PATTERNS.items() if pattern.search(plain)]
+
+
+def scrub(text):
+    """Text that is about to be logged, with key-like text and any key=... part hidden."""
+    return redact(KEY_LIKE_RE.sub("[hidden]", str(text)))
+
+
+def latest_completed_day(now):
+    """The UTC date of the newest completed daily candle on the day `now`: yesterday."""
+    return format_date(int(now.timestamp()) // SECONDS_PER_DAY * SECONDS_PER_DAY - SECONDS_PER_DAY)
+
+
+# ---- the evidence is completed by code, so it does not depend on which tools the AI chose to call.
+# The tools that only read data. search_playbook is not one of them: it is the AI's own look-up of the rules, and the sources that an alert
+# cites must come from what the AI searched (check R4).
+DATA_TOOLS = ("get_market_summary", "get_cross_asset_summary", "get_market_context", "get_alert_history_stats", "get_recent_decisions")
+
+
+def tool_label(item):
+    """How an evidence item is named in the logs and in check R5: the tool, with the coin for a market summary."""
+    coin = item["args"].get("coin")
+    return f"{item['tool']}({coin})" if coin else item["tool"]
+
+
+def was_called(evidence, tool, coin=None):
+    """True when the evidence holds a result of the tool (for the coin), an error result included: a tool that failed was still called."""
+    return any(item["tool"] == tool and (coin is None or item["args"].get("coin") == coin) for item in evidence)
+
+
+def complete_evidence(tools, evidence):
+    """Runs, with run_tool, every data tool that the AI did not call (a market summary for every watchlist coin, the cross-asset summary, the
+    market context, the alert history stats and the recent decisions), so the evidence is the same whichever tools the AI chose. The results
+    are appended to the same evidence list. A tool that fails stays in the evidence as an error result; nothing here raises. A tool that the
+    AI already called is never called again. A tool that is not in `tools` is skipped. Code only: no tokens. Returns the labels of what it added.
+    The draft was written without these extra results and is checked against the full evidence. It is not written again just because evidence
+    was added: it changes only through the normal finding paths (a missed breach, a number problem, advice wording)."""
+    wanted = []
+    for name in DATA_TOOLS:
+        if name not in tools:
+            continue
+        if name == "get_market_summary":
+            wanted += [(name, {"coin": coin}) for coin in WATCHLIST if not was_called(evidence, name, coin)]
+        elif not was_called(evidence, name):
+            wanted.append((name, {}))
+    added = []
+    for name, args in wanted:
+        before = len(evidence)
+        run_tool(tools, name, args, evidence)
+        if len(evidence) > before:
+            added.append(tool_label(evidence[-1]))
+    log("REVIEW evidence completed by code: " + (", ".join(added) or "nothing missing"))
+    return added
+
+
+# ---- the eight code checks. Each returns (passed, detail). A check that has nothing to look at (no alert drafted) passes and says so.
+CHECK_NAMES = {"R1": "numbers", "R2": "wording", "R3": "hygiene", "R4": "sources", "R5": "coverage", "R6": "freshness",
+               "R7": "breach", "R8": "corroboration"}
+NO_ALERT = "no alert drafted"
+
+
+def check_numbers(draft, shown):
+    """R1: every number in the message and the reasoning is in the evidence. The message is read the way the guardrail reads it
+    (a scale such as 59.1k is understood); the reasoning keeps the stricter reader that the reviewer always used."""
+    found = unsupported_message_numbers(draft["message"], shown) + unsupported_numbers(draft["reasoning"], shown)
+    return (False, number_problem(found)) if found else (True, "every number is in the evidence")
+
+
+def check_wording(draft):
+    """R2: no advice or forecast wording in the message or in the reasoning (the guardrail itself only reads the message)."""
+    where = [name for name in ("message", "reasoning") if has_advice_language(draft[name])]
+    return (False, "advice or forecast wording in the " + " and the ".join(where)) if where else (True, "no advice or forecast wording")
+
+
+def check_hygiene(draft):
+    """R3: no link, markup, key-like text or instruction-like text in the message or in the reasoning."""
+    found = []
+    for name in ("message", "reasoning"):
+        kinds = hygiene_kinds(draft[name])
+        if kinds:
+            found.append(f"the {name} holds " + " and ".join(kinds))
+    return (False, "; ".join(found)) if found else (True, "no link, markup, key-like text or instruction")
+
+
+def check_cited_sources(draft, evidence, titles):
+    """R4: every cited source is a real playbook section title, and the playbook was searched in this run."""
+    if not draft["alert"]:
+        return True, NO_ALERT
+    known = {title.lower() for title in titles}
+    wrong = [s for s in draft["sources"] if s.strip().lower() not in known]
+    problems = ["the alert cites no source"] if not draft["sources"] else []
+    if wrong:
+        problems.append(f"{len(wrong)} cited source(s) are not playbook section titles")
+    if not any(item["tool"] == "search_playbook" for item in evidence):
+        problems.append("the playbook was not searched in this run")
+    return (False, "; ".join(problems)) if problems else (True, "every source is a playbook section and the playbook was searched")
+
+
+def unusable(item):
+    """True when a data tool's latest result is an error (or not a dict; the recent decisions must also hold a list)."""
+    result = item["result"]
+    if not isinstance(result, dict) or "error" in result:
+        return True
+    return item["tool"] == "get_recent_decisions" and not isinstance(result.get("decisions"), list)
+
+
+def check_coverage(draft, evidence, added=()):
+    """R5: no data tool returned an error and no coin is without data (an alerted coin must have a market summary too). It does not fail
+    because the AI skipped a tool: complete_evidence ran what was missing. It runs on calm days as well. The detail records how many
+    tools the AI called itself and which ones the code added. The text of an error is not repeated here."""
+    latest = {tool_label(item): item for item in evidence}
+    by_code = [label for label in latest if label in added]
+    origin = f"AI called {len(latest) - len(by_code)}, code added {len(by_code)}" + (f": {', '.join(by_code)}" if by_code else "")
+    have = {summary.get("coin") for summary in market_summaries(evidence)}
+    tried = {item["args"].get("coin") for item in evidence if item["tool"] == "get_market_summary"}
+    wanted = list(dict.fromkeys([coin for coin in WATCHLIST if coin in tried] + (draft["coins"] if draft["alert"] else [])))
+    no_data = [coin for coin in wanted if coin not in have]
+    errors = [label for label, item in latest.items() if item["tool"] in DATA_TOOLS and unusable(item)
+              and not (item["tool"] == "get_market_summary" and item["args"].get("coin") in no_data)]
+    problems = []
+    if no_data:
+        problems.append(f"no valid market data for {', '.join(no_data)}")
+    if errors:
+        problems.append("tool result is an error: " + ", ".join(errors))
+    if problems:
+        return False, "; ".join(problems) + f" ({origin})"
+    return True, f"every data tool result is usable and every coin has data ({origin})"
+
+
+def check_freshness(draft, evidence, now):
+    """R6: each alerted coin's data is dated the latest completed UTC day, never the open candle."""
+    if not draft["alert"]:
+        return True, NO_ALERT
+    latest = latest_completed_day(now)
+    stale = []
+    for coin in draft["coins"]:
+        summary = last_result(evidence, "get_market_summary", coin)
+        if isinstance(summary, dict) and "error" not in summary and summary.get("as_of") != latest:
+            stale.append(coin)
+    return (False, f"{', '.join(stale)} not dated {latest}") if stale else (True, f"dated {latest}")
+
+
+def breach_comparison(draft, evidence):
+    """The comparison of the AI's answer with the code's own rank check, without logging: (breached, check, missed, unverified).
+    A coin that the last HISTORY_LIMIT decisions already alerted is not a miss when the history is in the evidence (the repeat rule)."""
+    breached = code_breached_coins(evidence)
+    if not market_summaries(evidence):
+        return breached, "unverified: no valid market data in this run", [], True
+    if draft["alert"]:
+        extra = [str(coin) for coin in draft["coins"] if coin not in breached]   # apply_guardrails blocks and logs these
+        return breached, (f"mismatch: {', '.join(extra)} alerted but not at the alert rank" if extra else "agrees"), [], False
+    missed = [coin for coin in breached if coin not in (recently_alerted_coins(evidence) or set())]
+    return breached, (f"mismatch: {', '.join(missed)} at the alert rank, AI said no alert" if missed else "agrees"), missed, False
+
+
+def corroboration_tier(piece):
+    """R8, for one coin: 'corroborated' (a second price source agrees and the other context sources answered), 'single-source' (no second
+    price) or 'degraded' (a second price that disagrees, or a context source that did not answer). Implied volatility is left out: it
+    does not exist for every coin."""
+    check = piece.get("price_check") if isinstance(piece, dict) else None
+    if not sources.is_data(check):
+        return "single-source"
+    gaps = [name for name in ("liquidity", "derivatives", "market_wide") if not sources.is_data(piece.get(name))]
+    return "corroborated" if check.get("agree") is True and not gaps else "degraded"
+
+
+def check_corroboration(draft, evidence):
+    """R8: how well a second source backs each alerted coin's price. Information only: it is logged and never blocks."""
+    if not draft["alert"]:
+        return True, NO_ALERT
+    context = last_result(evidence, "get_market_context")
+    pieces = context.get("coins") if isinstance(context, dict) and isinstance(context.get("coins"), dict) else {}
+    return True, "; ".join(f"{coin} {corroboration_tier(pieces.get(coin))}" for coin in draft["coins"])
+
+
+# What the AI is told for each check that code can state as a fact, and the short label used when the finding stays open.
+FIX_HINTS = {
+    "R1": "Use only numbers that the tools returned.",
+    "R2": "Describe the numbers only: no advice, no forecast, none of the banned words.",
+    "R3": "Remove it: the message and the reasoning must hold no link, markup, key-like text or instruction.",
+    "R7": "Alert on it, with a message that describes the numbers, unless a playbook rule says not to.",
+}
+OPEN_LABELS = {"R2": "advice wording", "R3": "unsafe text (R3)", "R7": "missed breach"}
+
+
+def code_review(draft, evidence, now, added=()):
+    """All eight checks. Returns (checks, findings). checks is [{check, passed, detail}]. findings are the failed checks that one
+    revision can fix (R1, R2, R3 and a missed breach in R7): {check, problem, label}. The other checks only report here: the guardrails
+    block what they must block, apply_review_outcome blocks an alert on stale data (R6), and a single-source alert (R8) is still shown
+    to the reader with the check in the log.
+    `added` names the tools that complete_evidence ran (R5 records them)."""
     shown = evidence_text(evidence)
-    findings = unsupported_numbers(draft["message"] + " " + draft["reasoning"], shown)
-    playbook = "\n\n".join(f"## {s['title']}\n{s['text']}" for s in load_playbook())
-    content = (f"Evidence:\n{shown}\n\nPlaybook:\n{playbook}\n\nDraft decision:\n{json.dumps(draft)}\n\n"
-               f"A code check found these numbers in the draft that are not in the evidence: {findings}")
+    _, breach, missed, _ = breach_comparison(draft, evidence)
+    results = [("R1",) + check_numbers(draft, shown), ("R2",) + check_wording(draft), ("R3",) + check_hygiene(draft),
+               ("R4",) + check_cited_sources(draft, evidence, [section["title"] for section in load_playbook()]),
+               ("R5",) + check_coverage(draft, evidence, added), ("R6",) + check_freshness(draft, evidence, now),
+               ("R7", breach == "agrees", breach), ("R8",) + check_corroboration(draft, evidence)]
+    checks = [{"check": name, "passed": passed, "detail": detail} for name, passed, detail in results]
+    findings = []
+    for item in checks:
+        name = item["check"]
+        if item["passed"] or name not in FIX_HINTS or (name == "R7" and not missed):
+            continue
+        if name == "R7":
+            problem = (f"the market data puts {', '.join(missed)} at or above the alert rank ({ALERT_RANK:g}) and the recent decisions do not "
+                       "already cover it. " + FIX_HINTS[name])
+        else:
+            problem = f"{item['detail']}. {FIX_HINTS[name]}"
+        findings.append({"check": name, "problem": problem[:400], "label": item["detail"] if name == "R1" else OPEN_LABELS[name]})
+    return checks, findings
+
+
+def run_code_review(draft, evidence, now, review, label="code checks"):
+    """The code review, logged: one summary line, one line for every failed check, and the R8 tier of an alert."""
+    review["checks"], findings = code_review(draft, evidence, now, review["evidence"]["code"])
+    failed = [item for item in review["checks"] if not item["passed"]]
+    log(f"REVIEW {label}: {len(review['checks']) - len(failed)} of {len(review['checks'])} passed "
+        f"({' '.join(item['check'] for item in review['checks'] if item['passed']) or 'none'})")
+    for item in failed:
+        log(f"REVIEW   {item['check']} {CHECK_NAMES[item['check']]} failed: {scrub(item['detail'])}")
+    if draft["alert"]:
+        log("REVIEW   R8 corroboration: " + next(item["detail"] for item in review["checks"] if item["check"] == "R8"))
+    return findings
+
+
+# ---- the AI review: small input, small answer.
+DIGEST_FIELDS = ("error", "as_of", "last_close", "daily_return_pct", "dist_from_30d_avg_pct", "volatility_30d_daily_pct",
+                 "max_drawdown_30d_pct", "ranks", "breaches", "context", "flags")
+OTHER_FIELDS = ("last_close", "daily_return_pct", "ranks", "breaches")   # what the AI review sees of a coin that is not alerted
+REVIEW_RULES = ("Alert rules", "Wording rules")                      # always sent to the AI review
+METRIC_RULES = {"volatility": "Volatility rule", "distance": "Trend against the 30-day average", "drawdown": "Drawdown rule"}
+
+
+def review_digest(draft, evidence, with_others=True):
+    """What the AI review sees of the evidence, built by code: the alerted coins in full, and the other coins in brief (four fields each,
+    so a number that belongs to another coin can be recognised). Not the tool JSON, not the playbook text the AI searched, not the free
+    text of a market summary and not the text of the old decisions (only their time and coins). with_others=False is the second trim step."""
+    context = last_result(evidence, "get_market_context")
+    cross = last_result(evidence, "get_cross_asset_summary")
+    stats = last_result(evidence, "get_alert_history_stats")
+    history = last_result(evidence, "get_recent_decisions")
+    coins = {}
+    for coin in draft["coins"]:
+        summary = last_result(evidence, "get_market_summary", coin)
+        entry = {key: summary[key] for key in DIGEST_FIELDS if isinstance(summary, dict) and key in summary}
+        if isinstance(context, dict) and isinstance(context.get("coins"), dict) and coin in context["coins"]:
+            entry["market_context"] = context["coins"][coin]
+        if isinstance(cross, dict) and "error" not in cross:
+            entry["relative_strength"] = [x for x in cross.get("relative_strength", []) if isinstance(x, dict) and x.get("coin") == coin]
+            entry["correlations"] = [x for x in cross.get("correlations", []) if isinstance(x, dict) and coin in str(x.get("pair", "")).split("-")]
+        if isinstance(stats, dict) and isinstance(stats.get("coins"), dict) and coin in stats["coins"]:
+            entry["alert_history"] = stats["coins"][coin]
+        coins[coin] = entry
+    digest = {"coins": coins}
+    if with_others:
+        others = {}
+        for coin in WATCHLIST:
+            summary = last_result(evidence, "get_market_summary", coin)
+            if coin not in draft["coins"] and isinstance(summary, dict) and "error" not in summary:
+                others[coin] = {key: summary[key] for key in OTHER_FIELDS if key in summary}
+        if others:
+            digest["other_coins"] = others
+    if isinstance(context, dict) and "error" not in context:
+        digest["sentiment"], digest["context_flags"] = context.get("sentiment"), context.get("flags", [])
+    if isinstance(history, dict) and isinstance(history.get("decisions"), list):
+        digest["recent_alerts"] = [{"time": d.get("time"), "coins": d.get("coins")} for d in history["decisions"]
+                                   if isinstance(d, dict) and d.get("alert") is True]
+    errors = {}
+    for tool in TOOL_SPECS:
+        result = last_result(evidence, tool)
+        if isinstance(result, dict) and "error" in result:
+            errors[tool] = str(result["error"])[:120]
+    if errors:
+        digest["tool_errors"] = errors
+    return digest
+
+
+def review_rule_titles(draft, evidence):
+    """The playbook sections the AI review gets, in the order they are sent: the two fixed ones first, then the section of the first metric
+    that an alerted coin breaches. Three at most."""
+    breached = set()
+    for coin in draft["coins"]:
+        summary = last_result(evidence, "get_market_summary", coin)
+        if isinstance(summary, dict) and isinstance(summary.get("breaches"), list):
+            breached.update(summary["breaches"])
+    return list(REVIEW_RULES) + [title for metric, title in METRIC_RULES.items() if metric in breached][:1]
+
+
+def review_rules(draft, evidence, titles=None):
+    """The playbook rules text for the AI review. Only the rule lines: the keywords and the reasons are left out."""
+    titles = review_rule_titles(draft, evidence) if titles is None else titles
+    sections = {section["title"]: section["text"] for section in load_playbook()}
+    parts = []
+    for title in titles:
+        lines = []
+        for line in sections.get(title, "").splitlines():
+            if line.startswith("Reason"):
+                break
+            if not line.startswith("Keywords:"):
+                lines.append(line)
+        if lines:
+            parts.append(f"## {title}\n" + "\n".join(lines).strip())
+    return "\n\n".join(parts)
+
+
+def estimate_tokens(messages):
+    """An ESTIMATE of the request size in tokens: the characters of every message divided by 4, rounded up. It is not Groq's count (the
+    run reports that one); it only has to be good enough to keep one request far below what the free tier refuses."""
+    return -(-sum(len(message["content"]) for message in messages) // 4)
+
+
+def review_messages_for(draft, evidence, titles, with_others):
+    """The request. The text that stays the same from run to run comes first (the instructions, then the fixed playbook rules) and the text
+    of this run comes last (the digest, then the draft), so the start of the request is identical every time."""
+    rules = review_rules(draft, evidence, titles) or "(left out to keep the request small)"
+    shown = {key: draft[key] for key in ("alert", "coins", "message", "sources", "reasoning")}
+    digest = json.dumps(review_digest(draft, evidence, with_others), separators=(",", ":"), default=str)
+    content = (f"Playbook rules:\n{rules}\n\nDigest of the evidence (alerted coins in full, other coins in brief):\n{digest}"
+               f"\n\nDraft decision:\n{json.dumps(shown)}")
+    return [{"role": "system", "content": REVIEW_PROMPT}, {"role": "user", "content": content}]
+
+
+def review_request(draft, evidence, cap=None):
+    """The AI review request, kept within the cap (REVIEW_REQUEST_CAP estimated tokens, system plus user). When it is over, it is trimmed in
+    this fixed order, one piece at a time, until it fits: the playbook excerpts (the metric rule, then the wording rules, then the alert
+    rules), then the other coins. The draft and the alerted coins' numbers are never trimmed. Returns {messages, tokens_estimate, trimmed,
+    fits}; fits is False when even the trimmed request is over the cap (then the AI is not called)."""
+    cap = REVIEW_REQUEST_CAP if cap is None else cap
+    titles, with_others, trimmed = review_rule_titles(draft, evidence), True, []
+    while True:
+        messages = review_messages_for(draft, evidence, titles, with_others)
+        size = estimate_tokens(messages)
+        if size <= cap:
+            return {"messages": messages, "tokens_estimate": size, "trimmed": trimmed, "fits": True}
+        if titles:
+            trimmed.append("playbook excerpt: " + titles.pop())
+        elif with_others:
+            with_others = False
+            trimmed.append("other coins")
+        else:
+            return {"messages": messages, "tokens_estimate": size, "trimmed": trimmed, "fits": False}
+
+
+def review_messages(draft, evidence):
+    return review_request(draft, evidence)["messages"]
+
+
+def parse_verdict(text):
+    """The AI review's reply as {approved, codes, notes}. A reply of the wrong shape raises ShapeError (the reviewer is then unusable and the
+    alert is never called approved). Codes outside the closed list become OTHER. A 'no' without a code is still a 'no' (OTHER)."""
+    data = extract_json(text)
+    if not isinstance(data.get("approved"), bool):
+        raise ShapeError("the reviewer reply has no true or false 'approved'")
+    codes, notes = data.get("codes", []), data.get("notes", data.get("problems", []))
+    if not isinstance(codes, list) or not isinstance(notes, list):
+        raise ShapeError("the reviewer reply has codes or notes that are not lists")
+    codes = list(dict.fromkeys(str(c).strip().upper() if str(c).strip().upper() in REVIEW_CODES else "OTHER" for c in codes))[:6]  # a code that is not on the list is OTHER
+    if data["approved"] and codes:
+        raise ShapeError("the reviewer approved and listed problems in the same reply")
+    if not data["approved"] and not codes:
+        codes = ["OTHER"]
+    return {"approved": data["approved"], "codes": codes, "notes": [str(n)[:160] for n in notes][:4]}
+
+
+def ai_review(messages, review):
+    """One compact AI review call. Returns the verdict, or None when the reviewer gave no usable answer. Never a guess. A reply that was
+    cut off at the small token cap is not usable, even when the part that arrived looks complete."""
+    review["ai_called"] = True
+    before = STATS["llm_tokens"]
     try:
-        reply = call_llm([{"role": "system", "content": REVIEW_PROMPT}, {"role": "user", "content": content}])
-        verdict = extract_json(reply.get("content") or "")
-        problems = verdict.get("problems", [])
-        if not isinstance(verdict.get("approved"), bool) or not isinstance(problems, list):
-            raise ShapeError("the reviewer reply has the wrong shape")
-        return {"approved": verdict["approved"], "problems": [str(p)[:200] for p in problems][:6]}
+        reply = call_llm(messages, max_tokens=REVIEW_MAX_TOKENS, model=reviewer_model())
+        if reply.get("finish_reason") == "length":
+            raise ShapeError(f"the reply was cut off at the {REVIEW_MAX_TOKENS} token cap")
+        return parse_verdict(reply.get("content") or "")
     except (ShapeError, AgentError) as error:
-        log(f"REVIEW skipped, the reviewer reply was not usable ({error}); the code guardrails still apply")
-        return {"approved": True, "problems": []}
+        review["ai_reason"] = "reviewer call failed" if isinstance(error, AgentError) else "reviewer reply not usable"
+        log(f"REVIEW AI review gave no usable answer ({review['ai_reason']}: {scrub(error)[:150]})")
+        return None
+    finally:
+        used = STATS["llm_tokens"] - before   # the provider's own count; nothing is added when it did not report one
+        if used > 0:
+            review["tokens"] = review.get("tokens", 0) + used
 
 
 def revise_draft(draft, problems, evidence):
     content = ("Evidence:\n" + evidence_text(evidence) + f"\n\nYour draft:\n{json.dumps(draft)}\n\n"
-               "A reviewer found these problems:\n- " + "\n- ".join(problems) +
+               "The review found these problems:\n- " + "\n- ".join(problems) +
                "\n\nReturn the corrected final JSON. If the problems cannot be fixed, set alert to false.")
     reply = call_llm([{"role": "system", "content": DECIDE_PROMPT}, {"role": "user", "content": content}])
     return parse_decision(reply.get("content") or "")
 
 
-def review_and_revise(draft, evidence):
-    verdict = review_draft(draft, evidence)
-    if verdict["approved"]:
-        log("REVIEW approved the draft")
-        return draft
-    log("REVIEW found problems: " + "; ".join(verdict["problems"]))
-    for _ in range(MAX_REVISIONS):
-        try:
-            draft = revise_draft(draft, verdict["problems"], evidence)
-            log("REVIEW: the agent revised its draft once")
-        except (ShapeError, AgentError) as error:
-            log(f"REVIEW: the revision was not usable ({error}); keeping the first draft")
-    return draft
+def revise_once(draft, problems, evidence):
+    """The one revision. Returns the revised draft, or None when it was not usable (then the first draft stays)."""
+    try:
+        revised = revise_draft({key: draft[key] for key in ("alert", "coins", "message", "sources", "reasoning")}, problems, evidence)
+    except (ShapeError, AgentError) as error:
+        log(f"REVIEW revision not usable ({scrub(error)[:150]}); the first draft stays")
+        return None
+    log("REVIEW revision: the agent revised its draft once")
+    return revised
+
+
+def review_stage(draft, evidence, use_ai=True, now=None, added=()):
+    """The review stage. Returns the draft (or its one revision) with two new keys: review_status, a short plain status, and review, the
+    structured record (checks, failed, evidence, ai_called, ai_reason, tokens, codes, revised). It never writes 'approved' for a review that
+    did not happen. Statuses: 'code-only: no alert drafted', 'code-only: AI review off', 'approved', 'revised' (the AI approved the revised
+    alert), 'unconfirmed: reviewer unavailable', 'rejected: CODES' (decide() blocks the alert), 'unresolved: <what>'.
+    `added` names the tools that complete_evidence ran; the record keeps which tools the AI called and which the code added."""
+    now = now or utc_now()
+    review = {"checks": [], "failed": [], "ai_called": False, "ai_reason": "", "revised": False, "codes": [], "unconfirmed": False,
+              "evidence": {"ai": [label for label in dict.fromkeys(tool_label(item) for item in evidence) if label not in added],
+                           "code": list(added)}}
+    findings = run_code_review(draft, evidence, now, review)
+    revisions_left, cause, status, called = MAX_REVISIONS, "code", "", 0
+    while True:
+        if findings:
+            if revisions_left <= 0:
+                if cause == "ai":
+                    status = "rejected: " + ", ".join(review["codes"])
+                else:
+                    status = "unresolved: " + "; ".join(dict.fromkeys(f["label"] for f in findings))
+                break
+            revisions_left -= 1
+            if cause == "code" and use_ai:
+                log("REVIEW AI review: not needed yet, a code finding goes straight to the one revision (the finding is a fact)")
+            revised = revise_once(draft, [f["problem"] for f in findings], evidence)
+            if revised is None:   # the first draft stays; an alert that the AI review rejected is still rejected
+                if cause == "ai":
+                    status = "rejected: " + ", ".join(review["codes"])
+                else:
+                    status = "unresolved: revision not usable"
+                break
+            draft, cause, review["revised"] = revised, "code", True
+            findings = run_code_review(draft, evidence, now, review, "code checks after the revision")
+            continue
+        if not draft["alert"] or not use_ai:
+            break
+        request = review_request(draft, evidence)
+        review["request_tokens_estimate"], review["trimmed"] = request["tokens_estimate"], request["trimmed"]
+        if request["trimmed"]:
+            log(f"REVIEW AI review request was over the cap of {REVIEW_REQUEST_CAP} estimated tokens, so it was trimmed: dropped "
+                + "; ".join(request["trimmed"]))
+        if request["fits"]:
+            called += 1
+            log(f"REVIEW AI review: called{' again for the revised alert' if called > 1 else ''} (an alert is drafted, so there is a claim "
+                f"to confirm; model {reviewer_model()})")
+            log(f"REVIEW AI review request: about {request['tokens_estimate']} tokens (an estimate: characters / 4; cap {REVIEW_REQUEST_CAP})")
+            verdict = ai_review(request["messages"], review)
+        else:
+            review["ai_reason"] = "reviewer request too large"
+            log(f"REVIEW AI review: not called: even trimmed, the request is about {request['tokens_estimate']} tokens (an estimate) and "
+                f"the cap is {REVIEW_REQUEST_CAP}")
+            verdict = None
+        if verdict is None:
+            review["unconfirmed"] = True
+            break
+        review["codes"] = verdict["codes"]   # the codes of the last verdict
+        if verdict["approved"]:
+            log("REVIEW AI verdict: approved")
+            break
+        log("REVIEW AI verdict: rejected (" + ", ".join(verdict["codes"]) + ")")
+        problems = [f"{code}: {REVIEW_CODES[code]}" for code in verdict["codes"]] + verdict["notes"]
+        findings, cause = [{"check": "AI", "problem": "; ".join(problems)[:400], "label": ""}], "ai"
+    if not status:
+        if review["unconfirmed"]:
+            status = "unconfirmed: reviewer unavailable"
+        elif not draft["alert"]:
+            status = "code-only: no alert drafted"
+        elif not use_ai:
+            status = "code-only: AI review off"
+        else:
+            status = "revised" if review["revised"] else "approved"
+    if not review["ai_called"] and not review["ai_reason"]:
+        review["ai_reason"] = (f"not run: {status}" if draft["alert"] and use_ai else
+                               "skipped: --reviewer off, the code review still ran" if draft["alert"] else
+                               "not needed: no alert drafted, so there is nothing to confirm")
+        log("REVIEW AI review: " + review["ai_reason"])
+    elif not review["ai_reason"]:
+        review["ai_reason"] = "called: an alert was drafted"
+    review["failed"] = [item["check"] for item in review["checks"] if not item["passed"]]
+    return dict(draft, review_status=status, review=review)
+
+
+def review_line(decision):
+    """The short review status for the Sheet's Review column (at most MAX_REVIEW_LINE_CHARS characters). Empty when there is none."""
+    status, review = decision.get("review_status"), decision.get("review")
+    if not status or not isinstance(review, dict):
+        return ""
+    parts = [status]
+    if review.get("revised") and "revised" not in status:
+        parts.append("revised once")
+    if review.get("failed"):
+        parts.append("failed: " + ", ".join(review["failed"]))
+    return " | ".join(parts)[:MAX_REVIEW_LINE_CHARS]
+
+
+def log_review_summary(decision):
+    """The last review line of a run: {"status", "failed", "ai_called", "tokens"}. tokens is the AI review's own count, left out when unknown."""
+    review = decision["review"]
+    summary = {"status": decision["review_status"], "failed": review["failed"], "ai_called": review["ai_called"]}
+    if review.get("tokens"):
+        summary["tokens"] = review["tokens"]
+    log("REVIEW " + json.dumps(summary, separators=(",", ":")))
+
+
+UNCONFIRMED_LABEL = "UNCONFIRMED: "
+
+
+def label_unconfirmed(message):
+    """(labelled message, number of sentences dropped). The label goes in front and the result is never longer than MAX_MESSAGE_CHARS.
+    When it does not fit, the last whole sentences are dropped (a sentence is never cut in half, so no number or word is damaged).
+    The text is None when not even the first sentence fits."""
+    room = MAX_MESSAGE_CHARS - len(UNCONFIRMED_LABEL)
+    if len(message) <= room:
+        return UNCONFIRMED_LABEL + message, 0
+    sentences = re.split(r"(?<=[.!?])\s+", message.strip())
+    kept = []
+    while sentences and len(" ".join(kept + sentences[:1])) <= room:
+        kept.append(sentences.pop(0))
+    return (UNCONFIRMED_LABEL + " ".join(kept) if kept else None), len(sentences)
+
+
+def apply_review_outcome(final):
+    """Runs after the guardrails. An alert that the AI review rejected and the revision did not fix is blocked ('reviewer: CODES'), so is
+    an alert whose message still holds unsafe text (R3). An alert that the reviewer could not confirm goes out labelled UNCONFIRMED."""
+    if not final["alert"]:
+        return final
+    review, reason, unsafe = final["review"], "", hygiene_kinds(final["message"])
+    stale = [item["detail"] for item in review["checks"] if item["check"] == "R6" and not item["passed"]]
+    if final["review_status"].startswith("rejected: "):
+        reason = "reviewer: " + ", ".join(review["codes"])
+    elif unsafe:
+        reason = "reviewer: R3 unsafe text in the message (" + ", ".join(unsafe) + ")"
+    elif stale:   # an alert that calls old data today's would mislead, so it is blocked and the reason is logged
+        reason = "reviewer: R6 stale data (" + stale[0] + ")"
+    elif review["unconfirmed"]:
+        labelled, dropped = label_unconfirmed(final["message"])
+        if labelled is None:
+            reason = "reviewer unavailable: the message is too long to carry the UNCONFIRMED label"
+        else:
+            review["label"] = "UNCONFIRMED" + (f", {dropped} sentence(s) dropped to fit" if dropped else "")
+            final["message"] = labelled
+            log(f"::warning::the AI reviewer could not confirm this alert ({review['ai_reason']}), so it is sent labelled UNCONFIRMED"
+                + (f" and its last {dropped} sentence(s) were dropped to stay within {MAX_MESSAGE_CHARS} characters" if dropped else "")
+                + ". The code review ran: see the REVIEW lines above.")
+    if reason:
+        log(f"GUARDRAIL blocked the alert: {reason}")
+        final.update(alert=False, coins=[], message="", blocked_reason=reason)
+    return final
 
 
 # ==============================================================================================
@@ -1133,6 +1776,40 @@ def recently_alerted_coins(evidence):
     return coins
 
 
+# The number check for an alert message, used by apply_guardrails (the reviewer keeps unsupported_numbers above, unchanged).
+# It reads numbers like unsupported_numbers does (same parsing, same allowed numbers, same rounding: half a unit in the last
+# written digit, so 20.5 matches 20.46). It adds two ways an honest message writes a real number differently from the JSON:
+# a scale after the number ("$59.1k", "$31.5B", "900 million": checked as the full number) and a window label from the code's own
+# windows ("60-day", "24-hour": a bare 60 or 24 is still checked). It only reports numbers; it never changes the message.
+SCALE_WORDS = {"k": 1e3, "thousand": 1e3, "m": 1e6, "mn": 1e6, "million": 1e6, "b": 1e9, "bn": 1e9, "billion": 1e9,
+               "t": 1e12, "tn": 1e12, "trillion": 1e12}
+WINDOW_LABELS = {TREND_LONG_DAYS: ("day", "days", "d"), 24: ("hour", "hours", "h")}
+WORD_AFTER_RE = re.compile(r"[-\s]?([A-Za-z]+)(?![A-Za-z0-9])")
+
+
+def unsupported_message_numbers(message, evidence_json):
+    known = [abs(value) for _, value, _ in numbers_in(evidence_json)]
+    bad = []
+    for found in NUMBER_RE.finditer(message):
+        raw = found.group()
+        cleaned = raw.replace(",", "").rstrip(".")
+        try:
+            value = abs(float(cleaned))
+        except ValueError:
+            continue
+        tolerance = 0.5 * 10 ** -(len(cleaned.split(".")[1]) if "." in cleaned else 0) + 1e-9
+        after = WORD_AFTER_RE.match(message, found.end())
+        word = after.group(1).lower() if after else ""
+        if word in SCALE_WORDS:
+            value, tolerance = value * SCALE_WORDS[word], tolerance * SCALE_WORDS[word]
+        elif word in WINDOW_LABELS.get(value, ()):
+            continue
+        if value in ALLOWED_NUMBERS or any(abs(value - k) <= tolerance for k in known):
+            continue
+        bad.append(raw)
+    return bad
+
+
 def apply_guardrails(draft, valid_titles, evidence):
     """Blocks an alert that breaks a rule. The AI cannot talk its way past this function."""
     final = dict(draft, blocked_reason="")
@@ -1144,13 +1821,12 @@ def apply_guardrails(draft, valid_titles, evidence):
     if draft["alert"]:
         if invalid or not final["sources"]:
             reason = "no valid source: every source must be a real playbook section title"
-        elif ADVICE_RE.search(draft["message"]):
+        elif has_advice_language(draft["message"]):
             reason = "advice language in the message"
-        elif not any(e["tool"] == "get_market_summary" and "error" not in e["result"] for e in evidence):
+        elif not market_summaries(evidence):   # a string, None or list from a tool is not market data (and must not crash this function)
             reason = "no valid market data in this run"
         else:
-            breached = {e["result"].get("coin") for e in evidence
-                        if e["tool"] == "get_market_summary" and "error" not in e["result"] and e["result"].get("breaches")}
+            breached = {summary.get("coin") for summary in market_summaries(evidence) if summary.get("breaches")}
             without = [coin for coin in draft["coins"] if coin not in breached]
             repeated = recently_alerted_coins(evidence)
             if without:
@@ -1160,47 +1836,98 @@ def apply_guardrails(draft, valid_titles, evidence):
                 # two other metrics were "new"). An alert that holds at least one coin not alerted recently is left to the AI.
                 reason = (f"{', '.join(draft['coins'])}: already alerted within the last {HISTORY_LIMIT} decisions "
                           "(Repeat alerts rule: no alert again for the same coin)")
+            else:
+                # The alert message may only use numbers that the tools returned. The reasoning is not checked here. A block, never a rewrite.
+                invented = list(dict.fromkeys(unsupported_message_numbers(draft["message"], evidence_text(evidence))))
+                if invented:
+                    reason = f"numbers not found in the evidence: {', '.join(invented)}"
     if reason:
         log(f"GUARDRAIL blocked the alert: {reason}")
         final.update(alert=False, coins=[], message="", blocked_reason=reason)
     return final
 
 
+def market_summaries(evidence):
+    """The get_market_summary results of this run that are real summaries (not errors, not odd types)."""
+    return [e["result"] for e in evidence
+            if e["tool"] == "get_market_summary" and isinstance(e["result"], dict) and "error" not in e["result"]]
+
+
+def code_breached_coins(evidence):
+    """The coins that the code's own rank check puts at the alert rank in this run's market summaries, as a sorted list.
+    It reads the 'breaches' list that add_breaches wrote, the same data the per-coin rule in apply_guardrails uses. No rank is recomputed here."""
+    return sorted({s["coin"] for s in market_summaries(evidence) if s.get("breaches") and isinstance(s.get("coin"), str)})
+
+
+def check_for_missed_breach(draft, evidence):
+    """Compares the AI's answer with the evidence and returns (code_breaches, check). It only reports: one ::warning:: line when a
+    'no alert' answer meets coins at the alert rank, or when the run gathered no market data to check against. It never changes the decision.
+    A coin that the last HISTORY_LIMIT decisions already alerted is not a miss when the history is in the evidence (the repeat rule).
+    The comparison itself is breach_comparison, which the review stage (check R7) uses as well."""
+    breached, check, missed, unverified = breach_comparison(draft, evidence)
+    if unverified:
+        log("::warning::no valid market data in this run, so the answer could not be checked against the alert rank.")
+    elif missed:
+        log(f"::warning::the AI said no alert, but the code finds {', '.join(missed)} at or above the alert rank ({ALERT_RANK:g}) "
+            "in this run's market data. Check the run before trusting this calm day.")
+    return breached, check
+
+
 # ==============================================================================================
-# 11. PUTTING IT TOGETHER: plan or loop, then reviewer, then guardrails
+# 11. PUTTING IT TOGETHER: plan or loop, then the review stage (always), then the guardrails
 # ==============================================================================================
 def version_name(mode, use_reviewer):
+    """The label saved with every row. ' + reviewer' means the AI review was on; the code review runs in every version."""
     return ("Planner" if mode == "planner" else "Agent loop") + (" + reviewer" if use_reviewer else "")
 
 
-def decide(mode, use_reviewer, tools):
+def decide(mode, use_reviewer, tools, now=None):
+    """The review stage runs on every run. use_reviewer only decides whether the AI review call is made for a drafted alert.
+    `now` is the clock for the freshness check (R6); only tests and the scenarios set it."""
     draft, evidence = run_planner(tools) if mode == "planner" else run_agent_loop(tools)
-    if use_reviewer:
-        draft = review_and_revise(draft, evidence)
-    if draft["alert"] and last_result(evidence, "get_recent_decisions") is None:
-        run_tool(tools, "get_recent_decisions", {}, evidence)   # the repeat check must not depend on the AI having asked for the history
+    # The evidence must not depend on which tools the AI chose to call: the code runs the data tools that it left out (the recent
+    # decisions among them, which the repeat rule and the review need). The draft was written without these extra results and is checked
+    # against the full evidence; it is not asked for again just because evidence was added.
+    added = complete_evidence(tools, evidence)
+    draft = review_stage(draft, evidence, use_reviewer, now, added)
     titles = [section["title"] for section in load_playbook()]
-    return apply_guardrails(draft, titles, evidence), evidence
+    final = apply_guardrails(draft, titles, evidence)
+    # Extra keys for the log line only (code_breaches, check, review_status, review): deliver() builds the Sheet row from named fields.
+    final["code_breaches"], final["check"] = check_for_missed_breach(draft, evidence)
+    final = apply_review_outcome(final)
+    log_review_summary(final)
+    return final, evidence
+
+
+def has_valid_market_data(evidence):
+    """True when at least one get_market_summary result in the evidence is real data: a dict with no error.
+    Same rule as the 'no valid market data in this run' guardrail, plus a dict check so an odd tool result cannot count."""
+    return any(e["tool"] == "get_market_summary" and isinstance(e["result"], dict) and "error" not in e["result"] for e in evidence)
 
 
 def run_live(mode, use_reviewer, dry_run):
     version = version_name(mode, use_reviewer)
     log(f"Version: {version} | model: {MODEL} | watchlist: {', '.join(WATCHLIST)}")
     decision, evidence = decide(mode, use_reviewer, TOOLS)
-    log("Decision: " + json.dumps(decision))
+    log("Decision: " + scrub(json.dumps(decision)))
     if dry_run:
         log("Dry run: nothing was posted to the Sheet")
     else:
         deliver(decision, version)
         publish_market_data(evidence, version)
     log(f"Run finished: alert={decision['alert']} llm_calls={STATS['llm_calls']}")
+    if not has_valid_market_data(evidence):
+        # The rows are saved first (the log of what happened stays). The run is then red, so a data outage is not a green day.
+        print("ERROR: no valid market data for any coin, see the market rows", file=sys.stderr)
+        return 1
     return 0
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Crypto watch agent (education only, not financial advice).")
     parser.add_argument("--mode", choices=["agent", "planner"], default=DEFAULT_MODE)
-    parser.add_argument("--reviewer", choices=["on", "off"], default="on" if USE_REVIEWER else "off")
+    parser.add_argument("--reviewer", choices=["on", "off"], default="on" if USE_REVIEWER else "off",
+                        help="on (default): the AI also reviews every drafted alert. off: skip only the AI review call; the code review always runs")
     parser.add_argument("--dry-run", action="store_true", help="do not post to the Sheet")
     parser.add_argument("--test", action="store_true", help="run the scenarios on fake tools")
     parser.add_argument("--only", default="", help="with --test: run only these scenarios, for example 8-16 or 1,3,5")

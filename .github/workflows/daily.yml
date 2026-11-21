@@ -35,12 +35,16 @@ jobs:
       - name: Install dependencies
         run: python -m pip install --disable-pip-version-check -r requirements.txt
 
-      # The version below is the one chosen in Step 13 (see README, "Results and conclusion").
-      # Change --mode (agent or planner) and --reviewer (on or off) here after you have measured.
+      # The version below is the one chosen in Step 13 (see README, "Results and conclusion"), now with the AI review on.
+      # The code review runs in every version and on every run. --reviewer on adds one small AI review call, and only when an alert
+      # is drafted: a calm day makes no review call. --reviewer off would skip only that AI call.
+      # Change --mode (agent or planner) here after you have measured.
       - name: Run the agent
         env:
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
           SHEET_URL: ${{ secrets.SHEET_URL }}
           # Optional and free (CoinGecko Demo key). When the secret does not exist this is empty and the CoinGecko fields say "not configured".
           COINGECKO_API_KEY: ${{ secrets.COINGECKO_API_KEY }}
-        run: python agent.py --mode agent --reviewer off
+          # Optional repository variable: another Groq model for the AI review call only. When it is not set, the review uses the main model.
+          REVIEWER_MODEL: ${{ vars.REVIEWER_MODEL }}
+        run: python agent.py --mode agent --reviewer on

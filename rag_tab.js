@@ -79,6 +79,15 @@
     return wrap;
   }
 
+  // "Why: <reason_text>" for every answer that is not a normal answer. The word Why and the amber bar are both there, so the reason is
+  // never shown by colour alone. It sits inside the live region (the answer box), so a screen reader announces it with the answer.
+  function reasonLine(text) {
+    var line = el("p", "reason");
+    line.appendChild(el("b", "", "Why:"));
+    line.appendChild(document.createTextNode(" " + text));
+    return line;
+  }
+
   function render(a) {
     clear(box);
     box.hidden = false;
@@ -88,8 +97,10 @@
     box.appendChild(head);
     if (a.question) { box.appendChild(el("blockquote", "q", a.question)); }
     box.appendChild(el("p", "bl", a.bottom_line));
+    if (a.reason_text && a.kind !== "answer") { box.appendChild(reasonLine(a.reason_text)); }
     if (a.kind === "declined" && a.why.length) { box.appendChild(el("p", "sub", a.why[0].text)); }
-    if (a.note && a.kind !== "declined") { box.appendChild(el("p", "sub", a.note)); }
+    // the reason line already says what the note says, except when the AI failed and the note names the error
+    if (a.note && a.kind !== "declined" && (!a.reason_text || a.reason === "ai_unavailable")) { box.appendChild(el("p", "sub", a.note)); }
     if (a.evidence.length) {
       box.appendChild(el("span", "cap", a.kind === "declined" ? "The rule behind this" : "From the playbook, word for word"));
       var hits = el("div", "hits");

@@ -25,7 +25,7 @@ MONO = "font-family:Consolas,Menlo,'Courier New',monospace;"
 RANK_BG = {"hi": "#C23B33", "mid": "#9A6414", "lo": "#26324A", "none": "#161E2D"}
 STRIP_BG = {4: "#E5483F", 3: "#B7791F", 2: "#3E5478", 1: "#2A3A57", 0: "#1B2538"}
 STATUS_BG = {"ALERT": "#C23B33", "NEAR": "#9A6414", "CALM": "#1F6F4A"}
-PILL_BG = {"red": "#C23B33", "green": "#1F6F4A", "grey": "#4A5568"}
+PILL_BG = {"red": "#C23B33", "green": "#1F6F4A", "grey": "#4A5568", "amber": "#9A6414"}
 TILE_COLOR = {"neg": "#FF8A80", "pos": "#5ED0A0", "amb": AMBER, "": TEXT}
 
 # The first section named here is the first to go when the email is over its size budget.

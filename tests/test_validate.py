@@ -117,6 +117,8 @@ FAULTS = {
     "a close of NaN": (edit(MID, C, "nan"), {"price_values": vd.FAIL}, True),
     "a close of infinity": (edit(MID, C, "inf"), {"price_values": vd.FAIL}, True),
     "a close that is a word": (edit(MID, C, "abc"), {"price_values": vd.FAIL}, True),
+    "a close with an underscore": (edit(MID, C, "1_000"), {"price_values": vd.FAIL}, True),
+    "a close in full-width digits": (edit(MID, C, "\uff16\uff10\uff14\uff15\uff12"), {"price_values": vd.FAIL}, True),
     "a close that is missing (null)": (edit(MID, C, None), {"price_values": vd.FAIL}, True),
     "a close of true": (edit(MID, C, True), {"price_values": vd.FAIL}, True),
     "a negative open": (edit(MID, O, "-1"), {"price_values": vd.FAIL}, True),

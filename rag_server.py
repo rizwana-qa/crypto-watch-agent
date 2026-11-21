@@ -8,6 +8,10 @@ Your Groq key stays on this computer: it is read from the GROQ_API_KEY environme
 sent to the browser, never written to a file and never logged. Without the key the page still works and shows the matching
 playbook text instead of a written answer.
 
+Each question writes one line to stderr and nothing else is logged:
+    [ask] kind=<kind> reason=<code> len=<characters> id=<first 8 hex of the SHA-256 of the question>
+It never holds the question text or any key. The reason is empty for a normal answer.
+
 The server listens on 127.0.0.1 only (not on your network). It accepts a request only when the Host header is this address,
 a browser request only from this page's own origin, and only JSON, so another web page cannot make your browser call it.
 """
@@ -117,9 +121,11 @@ class Handler(BaseHTTPRequestHandler):
             return
         try:
             answer = rag.ask(question, self.server.index, llm=self.server.llm, ai=self.server.ai)
-        except Exception:       # never show internals or the key in a reply
+        except Exception:       # never show internals or the key in a reply, or in the log
+            rag.log_ask({"question": rag.clean_question(question), "kind": "error", "reason": "server_error"})
             self._json(500, {"error": "Something went wrong while answering. Try again."})
             return
+        rag.log_ask(answer)
         self._json(200, answer)
 
 

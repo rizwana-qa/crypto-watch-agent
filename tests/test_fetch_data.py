@@ -275,6 +275,12 @@ SCENARIOS = [
       {"coingecko_agreement": vd.PASS}, "(the agent never reads the second source)", gecko=gecko_real_format, extra=extra_malformed_points_skipped),
     S("FD-45", "Second source answers in an unexpected shape (no prices): nothing to compare, the comparison is skipped", "Pass", "Pass", {"coingecko_agreement": vd.SKIP},
       "(optional source, nothing fails)", gecko=gecko_wrong_shape),
+    S("FD-46", "Close written with an underscore (\"1_000\"), which float() alone would accept", "Reject", "Reject", f("a close with an underscore"),
+      "as_number: numeric text is plain ASCII digits only", rows=rows_of("a close with an underscore")),
+    S("FD-47", "Close written in full-width digits, which float() alone would accept", "Reject", "Reject", f("a close in full-width digits"),
+      "as_number: numeric text is plain ASCII digits only", rows=rows_of("a close in full-width digits")),
+    S("FD-48", "Close missing (null)", "Reject", "Reject", f("a close that is missing (null)"), "as_number: a missing value is not a number",
+      rows=rows_of("a close that is missing (null)")),
 ]
 
 BRIEF = ["Negative trade count", "High below Low", "Close above High", "Wrong Kraken pair key", "Duplicate completed candle", "Duplicate unfinished candle",

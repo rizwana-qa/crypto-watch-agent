@@ -114,6 +114,15 @@ def _ok(coins):
     return [c for c in coins if "error" not in c]
 
 
+def unavailable(coins):
+    """Symbols of the coins that have no valid data today."""
+    return [c["coin"] for c in coins if "error" in c]
+
+
+def _and(names):
+    return names[0] if len(names) == 1 else ", ".join(names[:-1]) + " and " + names[-1]
+
+
 def metric_value(summary, metric):
     if metric == "volatility":
         return f"{summary['volatility_30d_daily_pct']:.2f}% a day"
@@ -181,7 +190,11 @@ def top_headlines(coins, context=None):
             items.append({"kicker": "Also at the alert rank", "text": "; ".join(parts) + " (ranks)"})
     else:
         closest = sorted(((max(c["summary"]["ranks"].values()), c["coin"]) for c in _ok(coins)), reverse=True)
-        if closest:
+        down = unavailable(coins)
+        if closest and down:
+            rank, coin = closest[0]
+            items.append({"kicker": "Partial data", "text": f"{_and(down)} unavailable. No other coin is at the alert rank of {agent.ALERT_RANK:g}. The closest is {coin} at rank {rank:.1f}"})
+        elif closest:
             rank, coin = closest[0]
             items.append({"kicker": "Calm market", "text": f"No coin is at the alert rank of {agent.ALERT_RANK:g}. The closest is {coin} at rank {rank:.1f}"})
     if len(items) < 2 and near(coins):
@@ -229,6 +242,9 @@ def subject_line(coins):
         else:
             line = f"Crypto Watch ALERT: {n} coins breach their own history, {lead}"
         fallback = f"Crypto Watch ALERT: {n} of {len(ok)} coins at the alert rank"
+    elif unavailable(coins):
+        line = f"Crypto Watch: partial data, {_and(unavailable(coins))} unavailable, no other coin at its alert rank"
+        fallback = "Crypto Watch: partial data, some coins unavailable"
     else:
         closest = sorted(((max(c["summary"]["ranks"].values()), c["coin"]) for c in ok), reverse=True)[0]
         line = f"Crypto Watch: calm market, no coin at its alert rank (closest {closest[1]}, rank {closest[0]:.0f})"

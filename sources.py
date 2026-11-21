@@ -11,6 +11,7 @@ Rules this module keeps:
 - Attribution: market-wide volume and prices come from CoinGecko, the fear and greed index from alternative.me.
 """
 import math
+import re
 import statistics
 import time
 from datetime import datetime, timezone
@@ -79,13 +80,18 @@ def safe(function, *args):
         return unavailable(f"unexpected reply ({type(error).__name__})")
 
 
+# Numeric text from a web reply: plain ASCII digits only (D-15), with plain spaces or line breaks around it allowed as before.
+# float() alone also accepts "1_000", full-width digits and other Unicode spaces, which are refused.
+NUMBER_TEXT_RE = re.compile(r"[ \t\r\n]*[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?[ \t\r\n]*\Z")
+
+
 def number(value, name, minimum=None):
-    """A finite float, or ValueError. Booleans and text that is not a number are refused."""
-    if isinstance(value, bool):
+    """A finite float, or ValueError. Booleans and text that is not a plain number (ASCII digits, a decimal point, an exponent, plain spaces around it) are refused."""
+    if isinstance(value, bool) or (isinstance(value, str) and not NUMBER_TEXT_RE.match(value)):
         raise ValueError(name)
     try:
         result = float(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):   # OverflowError: a JSON integer too large for a float
         raise ValueError(name)
     if not math.isfinite(result) or (minimum is not None and result < minimum):
         raise ValueError(name)
