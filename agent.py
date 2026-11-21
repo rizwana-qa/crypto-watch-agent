@@ -19,6 +19,7 @@ import re
 import statistics
 import sys
 import time
+import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -68,14 +69,71 @@ ADVICE_RE = re.compile(r"\b(?:" + "|".join(re.escape(w) for w in BANNED_WORDS) +
 # Plain market terms and the disclaimer that hold a banned word but give no advice. Only these exact phrases are cut out
 # (whole phrase, any case) before has_advice_language() checks the text. Nothing else is let through.
 ADVICE_SAFE_PHRASES = ["sell-off", "selloff", "long-term", "short-term", "mid-term", "short squeeze", "holding steady",
-                       "not financial advice", "not investment advice"]
+                       "not financial advice", "not investment advice", "not trading advice"]
 SAFE_PHRASE_RE = re.compile(r"\s*\b(?:" + "|".join(re.escape(p) for p in ADVICE_SAFE_PHRASES) + r")\b\s*", re.IGNORECASE)
 
 
+# Second layer (D-05): advice and forecasts written without a banned word ("add to their positions", "will likely rebound", "price target").
+# It only ever BLOCKS an alert, it never rewrites or adds anything, and it is narrow on purpose: every pattern needs a clear future or
+# instruction form, so a plain past-tense description ("BTC fell 8%", "volume was 2.4 times its average") never matches.
+# The playbook already says "no advice and no prediction"; this enforces the second half in code. A forecast can only be described as such
+# when the model writes one, so a miss costs nothing; a false block costs a missed alert, which is why tests/test_fix_d05_layer2.py holds a
+# large set of honest messages that must still pass.
+_MOVES = (r"(?:rise|rally|rebound|recover|crash|drop|fall|surge|moon|pump|dump|climb|soar|plunge|bounce|spike|tank|collapse|explode|"
+          r"break\s?out|reverse|double|triple|reach|hit|go\s+(?:up|down|higher|lower)|move\s+(?:up|down|higher|lower)|"
+          r"continue\s+(?:to\s+)?(?:rise|fall|climb|drop|rally|decline|higher|lower|up|down)|keep\s+(?:rising|falling|climbing|dropping))")
+_FUTURE = (r"(?:will|won't|going\s+to|gonna|expected\s+to|likely\s+to|probably\s+(?:will|to)|poised\s+to|bound\s+to|"
+           r"certain\s+to|sure\s+to|about\s+to)")
+_ADVICE_PATTERNS = [
+    # a forecast: a future or expectation word, up to two filler words, then a price move
+    rf"\b{_FUTURE}\s+(?:(?:likely|probably|soon|then|also|still|further|just|quickly|sharply|slowly|keep|continue)\s+){{0,2}}{_MOVES}\b",
+    r"\bexpect(?:s|ing)?\s+(?:\w+\s+){0,3}?(?:upside|downside|gains?|rally|rebound|recovery|bounce|pullback|correction|decline|drop|crash|"
+    r"breakout|reversal|surge|dip|continuation)\b",
+    r"\bprice\s+targets?\b|\btarget\s+price\b|\bprice\s+objective\b",
+    # a promise: "guaranteed", "risk free" (a plain "not guaranteed" disclaimer is cut out first)
+    r"\bguarantee[sd]?\b|\brisk[- ]free\b|\briskless\b|\bsure[- ]?(?:thing|fire)\b|\bcan(?:'t|not)\s+lose\b|\bno\s+risk\b|\beasy\s+money\b",
+    # advice written as a suggestion or a hint
+    r"\badd(?:ing)?\s+to\s+(?:(?:your|their|his|her|the|an?|existing)\s+)?(?:\w+\s+)?positions?\b",
+    r"\bload(?:ing)?\s+up\b",
+    r"\bget(?:ting)?\s+(?:in|out)\s+(?:now|here|early|before|while|fast|quickly|soon)\b|\bjump\s+in\s+(?:now|here|early|before|while)\b",
+    r"\bgo(?:ing)?\s+all[- ]in\b|\bdouble\s+down\b|\bcatch\s+the\s+(?:dip|falling\s+knife|wave|move)\b|\b(?:do\s+not|don'?t)\s+miss\b|\bfomo\b",
+    r"\bdiversif\w+\b|\brebalanc\w+\b|\bcut\s+(?:your\s+|their\s+)?losses\b",
+    r"\b(?:traders|investors|holders|readers|users|everyone|anyone)\s+(?:may|might|could|can|would|will)\s+(?:want|wish|consider|be\s+wise|do\s+well)\b",
+    r"\byou\s+(?:may|might|could|can|would|will)\s+(?:want|wish|consider|do\s+well)\b",
+    r"\b(?:consider|think\s+about)\s+(?:adding|reducing|trimming|increasing|decreasing|raising|lowering|cutting|closing|opening|entering|exiting|"
+    r"reallocating|rotating)\b",
+    r"\bwould\s+be\s+(?:wise|smart|prudent|sensible)\b",
+    r"\b(?:good|great|ideal|perfect|best|right|prime)\s+(?:moment|time|opportunity|chance|spot)\s+(?:to|for)\b",
+    r"\btime\s+to\s+(?:act|move|get|go|jump|enter|exit|close|add|trim|cut|reduce|increase|rotate|rebalance|reallocate|position)\b",
+    r"\b(?:opportunity|chance)\s+to\s+(?:add|enter|exit|trim|cut|reduce|increase|rotate|reallocate)\b",
+    r"\bwait(?:ing)?\s+for\s+(?:an?|the)\s+(?:\w+\s+)?(?:pullback|dip|retrace\w*|correction|breakout|confirmation|bounce|rebound|reversal)\b",
+    r"\b(?:use|exercise|take)\s+(?:extra\s+)?(?:caution|care)\b|\bproceed\s+with\s+caution\b|\bbe\s+(?:careful|cautious|wary|prepared|ready)\b|"
+    r"\bstay\s+(?:cautious|careful|vigilant|wary|safe)\b|\bwatch\s+out\b|\bdo\s+your\s+own\s+research\b|\bdyor\b",
+]
+ADVICE_PATTERN_RE = re.compile("|".join(f"(?:{p})" for p in _ADVICE_PATTERNS), re.IGNORECASE)
+# Plain disclaimers that hold a promise word but promise nothing. Cut out before the second layer only (never before the word list).
+ADVICE_DISCLAIMERS = ["not guaranteed", "no guarantee", "no guarantees", "not a guarantee", "cannot guarantee", "can't guarantee",
+                      "does not guarantee", "doesn't guarantee", "do not guarantee", "not a price target", "not price targets", "no price target"]
+DISCLAIMER_RE = re.compile(r"\s*\b(?:" + "|".join(re.escape(p) for p in ADVICE_DISCLAIMERS) + r")\b\s*", re.IGNORECASE)
+_HIDDEN_CHARS_RE = re.compile("[​‌‍⁠­﻿]")
+_SPACED_LETTERS_RE = re.compile(r"\b(?:[A-Za-z][\s.\-_*]){2,}[A-Za-z]\b")
+
+
+def plain_text(text):
+    """The text as a reader sees it: full-width and ligature letters become plain letters (NFKC), invisible characters are dropped and
+    letters spaced out one by one ('B U Y', 'b.u.y') are joined, so a word cannot be hidden from the check by its spelling."""
+    text = _HIDDEN_CHARS_RE.sub("", unicodedata.normalize("NFKC", str(text)))
+    return _SPACED_LETTERS_RE.sub(lambda match: re.sub(r"[\s.\-_*]", "", match.group(0)), text)
+
+
 def has_advice_language(text):
-    """True when the text has a banned word. The safe phrases are cut out first, each replaced by one space (with the spaces around it),
-    so a cut can never join two words, and a phrase placed inside a banned phrase ('take sell-off profit') still shows up."""
-    return bool(ADVICE_RE.search(SAFE_PHRASE_RE.sub(" ", text)))
+    """True when the text has a banned word or one of the second-layer patterns. The text is first made plain (plain_text). The safe
+    phrases are cut out next, each replaced by one space (with the spaces around it), so a cut can never join two words, and a phrase
+    placed inside a banned phrase ('take sell-off profit') still shows up. The plain disclaimers are cut out only before the patterns."""
+    cut = SAFE_PHRASE_RE.sub(" ", plain_text(text))
+    if ADVICE_RE.search(cut):
+        return True
+    return bool(ADVICE_PATTERN_RE.search(DISCLAIMER_RE.sub(" ", cut)))
 
 
 MODEL = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
@@ -123,12 +181,13 @@ CANDLE_TOLERANCE = 1e-9   # relative slack when one candle's own prices are comp
 
 
 def as_number(value):
-    """A finite float from a number or numeric text, else None. Booleans, NaN, infinity and words are refused."""
-    if isinstance(value, bool):
+    """A finite float from a number or numeric text, else None. Booleans, NaN, infinity, words and text that is not plain ASCII digits
+    ("1_000", full-width digits, Unicode spaces) are refused (D-15). Plain spaces around a number are still accepted."""
+    if isinstance(value, bool) or (isinstance(value, str) and not sources.NUMBER_TEXT_RE.match(value)):
         return None
     try:
         number = float(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):   # OverflowError: a JSON integer too large for a float
         return None
     return number if math.isfinite(number) else None
 

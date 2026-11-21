@@ -3,8 +3,9 @@
     python tests/test_fix_d05_d07.py -v
 
 D-07: a few exact market phrases and the disclaimer are cut out before the word check, so they no longer block an alert.
-D-05: the filter stays a plain word list on purpose. The sentences it does not catch are kept below as expected failures, so
-the gap is written down. If the filter is widened later, these tests start to pass and must then be turned into normal tests.
+D-05: the word list alone missed forecasts and advice written without a banned word. Seven such sentences were kept here as expected
+failures; a second, block-only layer now catches them and they are normal tests (FormerGapsD05). The layer itself and its set of
+honest messages that must still pass are in tests/test_fix_d05_layer2.py.
 """
 
 import sys
@@ -67,7 +68,7 @@ class MarketTermsAreAllowed(QuietCase):
     def test_the_allowed_phrases_are_exactly_the_agreed_list(self):
         self.assertEqual(sorted(agent.ADVICE_SAFE_PHRASES),
                          sorted(["sell-off", "selloff", "long-term", "short-term", "mid-term", "short squeeze", "holding steady",
-                                 "not financial advice", "not investment advice"]))
+                                 "not financial advice", "not investment advice", "not trading advice"]))
 
     def test_the_phrase_check_is_the_one_the_guardrail_uses(self):
         self.assertFalse(agent.has_advice_language("A sell-off and a short squeeze."))
@@ -116,43 +117,32 @@ class AdviceIsStillBlocked(QuietCase):
         self.assertDelivered("BTC 30-day daily volatility is 4.8%, rank 99.3.")
 
 
-class KnownGapsD05(QuietCase):
-    """The word list does not catch these. The owner agreed not to widen it now (option a). Each test says what should happen."""
+class FormerGapsD05(QuietCase):
+    """These sentences got past the word list alone. The second layer (agent.ADVICE_PATTERNS, tests/test_fix_d05_layer2.py) now blocks them."""
 
-    # known gap D-05: not blocked by the word list
-    @unittest.expectedFailure
     def test_add_to_positions(self):
         self.assertBlocked("Traders may want to add to their positions in BTC.")
 
-    # known gap D-05: not blocked by the word list
-    @unittest.expectedFailure
     def test_load_up(self):
         self.assertBlocked("This is a good moment to load up on BTC.")
 
-    # known gap D-05: not blocked by the word list
-    @unittest.expectedFailure
     def test_prediction_rebound(self):
         self.assertBlocked("BTC will likely rebound within days.")
 
-    # known gap D-05: not blocked by the word list
-    @unittest.expectedFailure
     def test_prediction_upside(self):
         self.assertBlocked("Expect further upside for BTC after this move.")
 
-    # known gap D-05: not blocked by the word list
-    @unittest.expectedFailure
     def test_price_target(self):
         self.assertBlocked("BTC has a price target well above its current close.")
 
-    # known gap D-05: not blocked by the word list
-    @unittest.expectedFailure
     def test_guarantee(self):
         self.assertBlocked("BTC is guaranteed to recover.")
 
-    # known gap D-05: not blocked by the word list
-    @unittest.expectedFailure
     def test_spaced_letters(self):
         self.assertBlocked("B U Y BTC now.")
+
+    def test_a_disclaimer_does_not_hide_advice(self):
+        self.assertBlocked("Not trading advice: buy BTC.")
 
 
 if __name__ == "__main__":

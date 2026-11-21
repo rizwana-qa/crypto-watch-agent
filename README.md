@@ -94,7 +94,7 @@ Call volume: each daily run makes 4 CoinGecko calls (one markets call and one vo
 - **Depth:** Kraken returns up to 720 recent candles, which is why the history used for ranking is about 700 days.
 - **Unfinished candle:** the last entry is the current, not-yet-committed day. The agent drops it, so every number comes from a completed UTC day.
 - **Checks in code (agent):** the reply must contain exactly the expected result key. Every row must have 8 values. The time must be a whole number that starts a UTC day, is not in the future and is later than the day before (no duplicate, no out-of-order candle, today's unfinished candle included). The close, open, high and low must be positive, finite numbers, with the high at least as large as the open, close and low and the low at most as small as the open, close and high. The volume must be zero or more and the trade count a whole number of zero or more. The completed days must be consecutive, at least 90 of them, ending yesterday, and the three coins must end on the same day. Anything else is an error, never a guess. A failed request is tried up to 3 times. The vwap is read by the audit only. The separate, stricter audit is described under [Data validation](#data-validation), and every rule above has a scenario in [Fetch-data scenarios](#fetch-data-scenarios-and-traceability).
-- **Status of this gate:** the stricter rules are new in this branch. They are tested offline (45 scenarios for each coin). On live data, `parse_candles` and `completed_closes` accepted all 2,163 candles of the three coins in the Data sources check run [44852768752](https://github.com/rizwana-qa/crypto-watch-agent/actions/runs/44852768752), and the validation in the same run found nothing to refuse. The same-day rule between the coins (`align_series`) first runs inside the agent at the next daily run.
+- **Status of this gate:** the stricter rules are new in this branch. They are tested offline (48 scenarios for each coin). On live data, `parse_candles` and `completed_closes` accepted all 2,163 candles of the three coins in the Data sources check run [44852768752](https://github.com/rizwana-qa/crypto-watch-agent/actions/runs/44852768752), and the validation in the same run found nothing to refuse. The same-day rule between the coins (`align_series`) first runs inside the agent at the next daily run.
 
 ## How it works
 
@@ -358,11 +358,14 @@ Coverage is measured, not claimed. The table below and the numbers under it are 
 | FD-43 | The other two coins are unavailable (this coin's data is fine): the date alignment cannot be checked and is reported as SKIP | Pass | Nothing reported | Pass | Pass | Pass | (nothing to align with); audit `coins_same_dates` |
 | FD-44 | Second source answers in its real format with malformed points mixed in: they are skipped, the rest is compared | Pass | Nothing reported | Pass | Pass | Pass | (the agent never reads the second source) |
 | FD-45 | Second source answers in an unexpected shape (no prices): nothing to compare, the comparison is skipped | Pass | Nothing reported | Pass | Pass | Pass | (optional source, nothing fails); audit `coingecko_agreement` |
+| FD-46 | Close written with an underscore ("1_000"), which float() alone would accept | Reject | Agent gate and audit | Reject | Reject | Reject | as_number: numeric text is plain ASCII digits only; audit `price_values` |
+| FD-47 | Close written in full-width digits, which float() alone would accept | Reject | Agent gate and audit | Reject | Reject | Reject | as_number: numeric text is plain ASCII digits only; audit `price_values` |
+| FD-48 | Close missing (null) | Reject | Agent gate and audit | Reject | Reject | Reject | as_number: a missing value is not a number; audit `price_values` |
 
 Measured coverage (from the run that produced this table):
 
-- **Scenarios:** 45, of which 12 are from the brief (FD-01 to FD-12) and 33 are added.
-- **Scenario x coin cells run:** 129. **As expected:** 129 of 129.
+- **Scenarios:** 48, of which 12 are from the brief (FD-01 to FD-12) and 36 are added.
+- **Scenario x coin cells run:** 138. **As expected:** 138 of 138.
 - **Audit checks that report a non-PASS in at least one scenario:** 17 of 17.
 - **Executable lines run by the scenarios** (Python's `trace` module): `fetch_coingecko` 100%, `fetch_rows` 100%, `fetch_candles` 100%, `as_number` 100%, `parse_candles` 100%, `completed_closes` 100%, `align_series` 100%, `check_rows` 100%, `check_coins_aligned` 100%, `check_against_coingecko` 100%, `coingecko_prices` 100%, `validate` 100%, `verdict` 100%, `num` 100%, `is_whole` 100%, `label` 100%, `examples` 100%.
 

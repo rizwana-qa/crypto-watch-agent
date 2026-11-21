@@ -71,14 +71,9 @@ def result(coin, check, status, detail):
 
 
 def num(value):
-    """A finite float from a number or numeric text, else None. Booleans, NaN, infinity and words are refused."""
-    if isinstance(value, bool) or value is None:
-        return None
-    try:
-        out = float(value)
-    except (TypeError, ValueError):
-        return None
-    return out if math.isfinite(out) else None
+    """A finite float from a number or numeric text, else None. Booleans, NaN, infinity, words and text that is not plain ASCII digits
+    ("1_000", full-width digits) are refused. The same rule as agent.as_number, so the gate and the agent never disagree."""
+    return agent.as_number(value)
 
 
 def is_whole(value):
