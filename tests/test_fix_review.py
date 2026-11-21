@@ -568,6 +568,18 @@ class CodeFindingsGoToTheRevision(ReviewCase):
         self.assertEqual(decision["blocked_reason"], "reviewer: R3 unsafe text in the message (a link)")
         self.assertEqual(decision["message"], "")
 
+    def test_an_alert_on_stale_data_is_blocked_with_the_reason(self):
+        later = agent.datetime(2026, 11, 22, 5, 17, tzinfo=agent.timezone.utc)   # two days after the fake data, so they are no longer the latest day
+        script = Script([EVERYTHING, say(GOOD)], 0)
+        tools = scenarios.fake_tools(scenarios.btc_spike(scenarios.calm()), [])
+        with mock.patch.object(agent, "call_llm", script):
+            decision, _ = agent.decide("agent", False, tools, now=later)
+        self.assertFalse(decision["alert"])
+        self.assertEqual(decision["message"], "")
+        self.assertTrue(decision["blocked_reason"].startswith("reviewer: R6 stale data (BTC not dated "), decision["blocked_reason"])
+        fresh, _, _ = self.go([EVERYTHING, say(GOOD)], reviewer=False)   # the same data one day after: not blocked
+        self.assertTrue(fresh["alert"])
+
     def test_unsafe_text_in_the_reasoning_is_found_and_never_logged(self):
         token = "gsk_" + "Zz9Yy8Xx" * 5
         leaky = dict(GOOD, reasoning=f"BTC rank 99.3 is at or above 95. {token}")
@@ -863,10 +875,14 @@ class FlagAndModel(ReviewCase):
             before = agent.STATS["llm_tokens"]
             agent.call_llm([{"role": "user", "content": "hi"}])
             agent.call_llm([{"role": "user", "content": "hi"}], max_tokens=agent.REVIEW_MAX_TOKENS, model="other/model")
+            agent.call_llm([{"role": "user", "content": "hi"}], max_tokens=agent.REVIEW_MAX_TOKENS, model="openai/gpt-oss-20b")
         self.assertEqual(sent[0]["model"], agent.MODEL)
         self.assertNotIn("max_tokens", sent[0])   # the default behaviour of every other caller is unchanged
+        self.assertNotIn("reasoning_effort", sent[0])
         self.assertEqual((sent[1]["model"], sent[1]["max_tokens"]), ("other/model", agent.REVIEW_MAX_TOKENS))
-        self.assertEqual(agent.STATS["llm_tokens"] - before, 642)
+        self.assertNotIn("reasoning_effort", sent[1])   # only the gpt-oss models are told how hard to think
+        self.assertEqual(sent[2]["reasoning_effort"], agent.REVIEW_REASONING_EFFORT)
+        self.assertEqual(agent.STATS["llm_tokens"] - before, 963)
 
     def test_the_scenarios_use_the_fake_clock_so_their_alerts_are_fresh(self):
         scenario = scenarios.scenarios()[1]

@@ -316,6 +316,23 @@ def parse_only(text):
     return numbers
 
 
+def result_label(result):
+    """PASS, FAIL, or DID NOT FINISH. A scenario that the AI could not answer (a rate limit, a provider error) says nothing about the logic,
+    so the Sheet must not show it as a FAIL of the agent."""
+    if result["passed"]:
+        return "PASS"
+    return "FAIL" if result.get("finished", True) else "DID NOT FINISH"
+
+
+def unfinished_reason(result):
+    """One plain sentence for the Expected column of a scenario that did not finish. The provider's own error text is not copied into the Sheet."""
+    if result.get("finished", True):
+        return result["expected"]
+    why = result.get("why", "")
+    return ("no decision: the AI call was refused with HTTP 429 (a rate limit); see the run log" if "429" in why
+            else "no decision: the AI call failed; see the run log")
+
+
 def publish(results, version):
     """Writes every scenario result to the scenarios tab: how the agent shares its output in each situation."""
     stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
@@ -323,7 +340,7 @@ def publish(results, version):
     rows = []
     for number, result in results:
         d = result["decision"] or {}
-        rows.append([stamp, run_id, version, number, result["name"], "PASS" if result["passed"] else "FAIL", result["expected"],
+        rows.append([stamp, run_id, version, number, result["name"], result_label(result), unfinished_reason(result),
                      d.get("alert", ""), ", ".join(d.get("coins", [])), d.get("message", ""), " | ".join(d.get("sources", [])),
                      d.get("blocked_reason", ""), result["calls"]])
     agent.sheet_append("scenarios", rows)

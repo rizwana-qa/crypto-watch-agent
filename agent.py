@@ -53,7 +53,8 @@ USE_REVIEWER = True     # the AI review switch; --reviewer on|off overrides it. 
 MAX_STEPS = 12          # agent loop: the most AI calls before the run stops with an error (8 before the two context tools; a model that calls one tool at a time needs 9 or more)
 MAX_FIX_ATTEMPTS = 2    # how often the AI may be asked again after an invalid answer
 MAX_REVISIONS = 1       # how often the agent may revise after the review found problems (a code finding or an AI rejection)
-REVIEW_MAX_TOKENS = 400 # reply cap for the AI review call: a small JSON verdict (a reasoning model also spends part of this on thinking)
+REVIEW_MAX_TOKENS = 1000 # reply cap for the AI review call: a small JSON verdict. A reasoning model may spend part of the cap on thinking, so it is not set tight
+REVIEW_REASONING_EFFORT = "low"   # sent only with the review call and only to an openai/gpt-oss model (Groq documents low, medium and high for them): a verdict needs little thinking
 REVIEW_REQUEST_CAP = 3000  # the most the whole AI review request (system plus user) may be, in ESTIMATED tokens (characters / 4, not a Groq count); the free tier refuses one request that is too large
 MAX_REVIEW_LINE_CHARS = 200  # the short review status that goes into the Sheet's Review column
 MAX_PLAN_STEPS = 12     # planner: the most steps a plan may have (3 market + cross-asset + context + stats + history + playbook searches)
@@ -961,6 +962,8 @@ def call_llm(messages, tools=None, max_tokens=None, model=None):
     payload = {"model": model or MODEL, "messages": messages, "temperature": 0}
     if max_tokens:
         payload["max_tokens"] = max_tokens
+        if payload["model"].startswith("openai/gpt-oss"):
+            payload["reasoning_effort"] = REVIEW_REASONING_EFFORT
     if tools:
         payload.update(tools=tools, tool_choice="auto")
     for attempt in range(1, MAX_LLM_ATTEMPTS + 1):
@@ -1392,8 +1395,9 @@ OPEN_LABELS = {"R2": "advice wording", "R3": "unsafe text (R3)", "R7": "missed b
 
 def code_review(draft, evidence, now, added=()):
     """All eight checks. Returns (checks, findings). checks is [{check, passed, detail}]. findings are the failed checks that one
-    revision can fix (R1, R2, R3 and a missed breach in R7): {check, problem, label}. The other checks only report: the guardrails
-    block what they must block, and a stale or single-source alert is still shown to the reader with the check in the log.
+    revision can fix (R1, R2, R3 and a missed breach in R7): {check, problem, label}. The other checks only report here: the guardrails
+    block what they must block, apply_review_outcome blocks an alert on stale data (R6), and a single-source alert (R8) is still shown
+    to the reader with the check in the log.
     `added` names the tools that complete_evidence ran (R5 records them)."""
     shown = evidence_text(evidence)
     _, breach, missed, _ = breach_comparison(draft, evidence)
@@ -1733,10 +1737,13 @@ def apply_review_outcome(final):
     if not final["alert"]:
         return final
     review, reason, unsafe = final["review"], "", hygiene_kinds(final["message"])
+    stale = [item["detail"] for item in review["checks"] if item["check"] == "R6" and not item["passed"]]
     if final["review_status"].startswith("rejected: "):
         reason = "reviewer: " + ", ".join(review["codes"])
     elif unsafe:
         reason = "reviewer: R3 unsafe text in the message (" + ", ".join(unsafe) + ")"
+    elif stale:   # an alert that calls old data today's would mislead, so it is blocked and the reason is logged
+        reason = "reviewer: R6 stale data (" + stale[0] + ")"
     elif review["unconfirmed"]:
         labelled, dropped = label_unconfirmed(final["message"])
         if labelled is None:
