@@ -3,7 +3,10 @@
  *
  * Four actions, all sent as a POST with a JSON body to  <web app URL>?key=<KEY>
  *   history   returns the agent's own recent decisions from the Agent tab (the agent's memory)
- *   save      adds one row to the Agent tab and, when alert is true, sends an email
+ *   save      adds one row to the Agent tab and, when alert is true, sends an email. The row has 10 cells: the last one, "Review",
+ *             is the agent's short review status (at most 200 characters). It is optional: a save without a "review" field still
+ *             works and leaves the cell empty. An Agent tab that has only the old 9 columns gets the header "Review" added in
+ *             column J on the next call; the rows already there are not touched, and the history action reads old and new rows alike.
  *   report    emails the executive brief: the brief itself as the HTML body and the full interactive HTML page as an attachment
  *   append    adds rows to one of three extra tabs: market_data (the Kraken numbers per coin), cross_asset
  *             (correlation between coins) and scenarios (every scenario result). Only these three tab names are
@@ -25,7 +28,8 @@
  */
 
 const SHEET_NAME = 'Agent';
-const HEADERS = ['Time (UTC)', 'Version', 'Run ID', 'Alert', 'Coins', 'Message', 'Sources', 'Reasoning', 'Blocked reason'];
+const HEADERS = ['Time (UTC)', 'Version', 'Run ID', 'Alert', 'Coins', 'Message', 'Sources', 'Reasoning', 'Blocked reason', 'Review'];
+const MAX_REVIEW_CHARS = 200;   // the Review cell; agent.py sends at most this many
 const MAX_BODY_CHARS = 20000;
 const MAX_REPORT_CHARS = 600000;   // the executive brief page, sent only with action "report"
 const MAX_SUMMARY_CHARS = 100000;   // the email body; Gmail clips an HTML email near 102 KB, and report.py keeps it under 90 KB
@@ -125,7 +129,16 @@ function sheet_(props) {
   let sheet = spreadsheet.getSheets().filter(function (s) { return s.getName().trim().toLowerCase() === wanted; })[0];
   if (!sheet) sheet = spreadsheet.insertSheet(SHEET_NAME);
   if (sheet.getLastRow() === 0) sheet.appendRow(HEADERS);
+  addReviewColumn_(sheet);
   return sheet;
+}
+
+// An Agent tab made before the Review column existed has 9 columns. Add the header cell (column J) and nothing else: the rows
+// that are already there stay as they are, and their Review cell stays empty. A tab that already has 10 or more columns is left alone.
+function addReviewColumn_(sheet) {
+  if (sheet.getLastColumn() >= HEADERS.length) return;
+  if (sheet.getMaxColumns() < HEADERS.length) sheet.insertColumnsAfter(sheet.getMaxColumns(), HEADERS.length - sheet.getMaxColumns());
+  sheet.getRange(1, HEADERS.length).setValue(HEADERS[HEADERS.length - 1]);
 }
 
 // The agent's memory: the last `limit` rows, oldest first.
@@ -163,7 +176,7 @@ function save_(request, props) {
   const row = [
     clean_(request.time), clean_(request.version), clean_(request.run_id), request.alert ? 'TRUE' : 'FALSE',
     request.coins.map(clean_).join(', '), clean_(request.message), request.sources.map(clean_).join(' | '),
-    clean_(request.reasoning), clean_(request.blocked_reason),
+    clean_(request.reasoning), clean_(request.blocked_reason), clean_(request.review).slice(0, MAX_REVIEW_CHARS),
   ];
   const runId = runKey_(row[2]);
   return withRunLock_(runId, function () {

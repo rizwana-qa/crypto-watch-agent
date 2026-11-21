@@ -50,6 +50,12 @@ class CodeGsRunIdCheck(unittest.TestCase):
             with self.subTest(result["name"]):
                 self.assertTrue(result["ok"], result["detail"])
 
+    def test_the_review_column_cases_ran(self):
+        names = " ".join(r["name"] for r in self.results)
+        for needle in ("the row has 10 cells", "without a review field", "cut at 200 characters", "old 9-column Agent tab gets the Review header",
+                       "duplicate run ID is still ignored on an old 9-column tab", "old 9-column rows and new 10-column rows are read alike"):
+            self.assertIn(needle, names)
+
 
 def header_list(source, name):
     """The quoted names of the array that follows `name: [` or `const name = [` in Code.gs."""
@@ -97,6 +103,33 @@ class WhereTheRunIdLands(unittest.TestCase):
                 mock.patch.object(agent, "sheet_append", lambda tab, rows: captured.append((tab, rows))):
             scenarios.publish([(1, result)], "v")
         self.assertEqual(captured[0][1][0][1], "RID")
+
+
+class TheReviewColumn(unittest.TestCase):
+    """The optional last column of the Agent tab. The row-level behaviour is tested in the Node file; these pin the parts that Python can see."""
+
+    def test_the_agent_tab_has_ten_headers_and_review_is_the_last(self):
+        headers = header_list(CODE_GS, "HEADERS")
+        self.assertEqual(len(headers), 10)
+        self.assertEqual(headers[-1], "Review")
+        self.assertEqual(headers[:3], ["Time (UTC)", "Version", "Run ID"])   # the columns that history and the duplicate check read did not move
+
+    def test_the_header_comment_of_code_gs_describes_the_review_column(self):
+        header = CODE_GS[:CODE_GS.index("const ")]
+        self.assertIn("Review", header)
+        self.assertIn("old 9 columns", header)   # it says what happens to an older tab with nine columns
+
+    def test_the_save_payload_carries_the_short_review_text_and_stays_short(self):
+        reply = mock.Mock(status_code=200, json=lambda: {"success": True, "row": 2, "emailed": False})
+        reply.raise_for_status = lambda: None
+        decision = {"alert": False, "coins": [], "message": "", "sources": [], "reasoning": "r", "blocked_reason": "",
+                    "review_status": "code-only: no alert drafted", "review": {"failed": ["R7"], "revised": False}}
+        with mock.patch.dict("os.environ", {"SHEET_URL": "https://example.invalid/exec?key=k", "GITHUB_RUN_ID": "9"}), \
+                mock.patch.object(agent.requests, "post", return_value=reply) as post:
+            agent.deliver(decision, "Agent loop + reviewer")
+        sent = post.call_args.kwargs["json"]
+        self.assertEqual(sent["review"], "code-only: no alert drafted | failed: R7")
+        self.assertLessEqual(len(sent["review"]), agent.MAX_REVIEW_LINE_CHARS)
 
 
 if __name__ == "__main__":

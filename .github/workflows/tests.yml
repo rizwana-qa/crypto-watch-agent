@@ -32,10 +32,10 @@ on:
         options: [agent, planner]
         default: agent
       reviewer:
-        description: "Second AI pass over the draft (extra AI call per scenario)"
+        description: "AI review of a drafted alert (one small extra AI call, only on scenarios that draft an alert; the code review always runs)"
         type: choice
-        options: ["off", "on"]
-        default: "off"
+        options: ["on", "off"]
+        default: "on"
       only:
         description: "Which scenarios to run, for example 10,14,11 or 1,3,5. A scenario costs about 23K tokens with the six tools (14K calm, up to 30K with an alert), and the free Groq cap is 200K a day, so run about six a day (see the README, Token budget)"
         type: string
@@ -129,4 +129,4 @@ jobs:
         run: |
           flags=()
           if [ "${PUBLISH}" = "yes" ]; then flags+=(--publish); fi
-          python agent.py --test --mode "${MODE:-agent}" --reviewer "${REVIEWER:-off}" --only "${ONLY}" "${flags[@]}"
+          python agent.py --test --mode "${MODE:-agent}" --reviewer "${REVIEWER:-on}" --only "${ONLY}" "${flags[@]}"
