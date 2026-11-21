@@ -1,4 +1,5 @@
-// Offline test for the run ID check in apps_script/Code.gs (fix D-10). Plain Node, no packages, no network.
+// Offline test for the run ID check in apps_script/Code.gs (fix D-10) and for the optional Review column of the Agent tab.
+// Plain Node, no packages, no network.
 //
 // Apps Script cannot run here, so this loads Code.gs with the vm module and a small in-file mock of SpreadsheetApp,
 // LockService, ContentService, MailApp, PropertiesService and Session. The real Apps Script runtime was NOT run.
@@ -23,9 +24,18 @@ function makeWorld() {
   const world = { sheets: [], mails: [], events: [], lockHeld: false, lockCalls: 0, failNextSetValues: false };
 
   function makeSheet(name) {
-    const sheet = { name: name, rows: [] };   // rows: array of arrays, 0-based; sheet row n is rows[n - 1]
+    const sheet = { name: name, rows: [], maxColumns: 26 };   // rows: array of arrays, 0-based; sheet row n is rows[n - 1]
     sheet.getName = function () { return name; };
     sheet.getLastRow = function () { return sheet.rows.length; };
+    sheet.getLastColumn = function () {   // the right-most column that holds anything, like Sheets
+      let last = 0;
+      sheet.rows.forEach(function (row) {
+        row.forEach(function (value, c) { if (value !== undefined && value !== '') last = Math.max(last, c + 1); });
+      });
+      return last;
+    };
+    sheet.getMaxColumns = function () { return sheet.maxColumns; };
+    sheet.insertColumnsAfter = function (after, howMany) { sheet.maxColumns += howMany; world.events.push('insertColumns:' + name + ':' + after + ',' + howMany); };
     sheet.appendRow = function (row) { sheet.rows.push(row.slice()); world.events.push('write:' + name); };
     sheet.setFrozenRows = function () {};
     sheet.getRange = function (row, col, numRows, numCols) {
@@ -35,6 +45,13 @@ function makeWorld() {
       const range = { text: false };
       range.setNumberFormat = function (format) { range.text = format === '@'; return range; };
       range.setFontWeight = function () { return range; };
+      range.setValue = function (value) {   // one cell; nothing else in the sheet is touched
+        if (col > sheet.maxColumns) throw new Error('the column is outside the sheet');
+        world.events.push('write:' + name);
+        const target = sheet.rows[row - 1] || (sheet.rows[row - 1] = []);
+        target[col - 1] = value;
+        return range;
+      };
       range.getValues = function () {
         world.events.push('read:' + name);
         const out = [];
@@ -110,6 +127,13 @@ function makeWorld() {
   };
   world.post = function (body) { return world.postWithKey(KEY, body); };
   world.sheet = function (name) { return world.sheets.filter(function (s) { return s.name === name; })[0]; };
+  world.addSheet = function (name, rows, maxColumns) {   // a tab that already exists, for example one made before the Review column
+    const sheet = spreadsheet.insertSheet(name);
+    rows.forEach(function (row) { sheet.rows.push(row.slice()); });
+    if (maxColumns) sheet.maxColumns = maxColumns;
+    world.events.length = 0;
+    return sheet;
+  };
   world.dataRows = function (name) { const s = world.sheet(name); return s ? s.rows.length - 1 : 0; };
   return world;
 }
@@ -406,6 +430,133 @@ test('append: a bad payload is still refused and takes no lock', function () {
   eq(w.lockCalls, 0, 'lock calls');
   const bad = w.post(appendPayload('not_a_tab', [marketRow('1001', 'BTC')]));
   eq(bad, { success: false, error: 'INVALID_PAYLOAD' }, 'reply for an unknown tab');
+});
+
+// the optional Review column of the Agent tab
+
+const OLD_HEADERS = ['Time (UTC)', 'Version', 'Run ID', 'Alert', 'Coins', 'Message', 'Sources', 'Reasoning', 'Blocked reason'];
+function oldRow(runId, alert) {   // a row as an older Code.gs wrote it: 9 cells
+  return ['2026-11-19T05:17:02Z', 'Agent loop', runId, alert ? 'TRUE' : 'FALSE', alert ? 'BTC' : '', alert ? 'BTC old alert' : '', 'Alert rules', 'old reasoning', ''];
+}
+
+test('save: the row has 10 cells and the review text is the last one, under the header Review', function () {
+  const w = makeWorld();
+  const r = w.post(savePayload({ review: 'approved' }));
+  eq(r.success, true, 'success');
+  eq(w.sheet('Agent').rows[0].length, 10, 'header cells');
+  eq(w.sheet('Agent').rows[0][9], 'Review', 'last header');
+  eq(w.sheet('Agent').rows[1].length, 10, 'row cells');
+  eq(w.sheet('Agent').rows[1][9], 'approved', 'review cell');
+  eq(w.sheet('Agent').rows[1][5], 'BTC moved', 'message cell is where it was');
+  eq(w.mails.length, 1, 'emails sent');
+});
+
+test('save: a payload without a review field still works and leaves the Review cell empty', function () {
+  const w = makeWorld();
+  const r = w.post(savePayload());   // the payload of an older agent.py
+  eq(r.success, true, 'success');
+  eq(r.row, 2, 'row number');
+  eq(w.sheet('Agent').rows[1].length, 10, 'row cells');
+  eq(w.sheet('Agent').rows[1][9], '', 'review cell');
+  eq(w.mails.length, 1, 'emails sent');
+});
+
+test('save: the review text is cut at 200 characters and is written as text (a number-like text stays text)', function () {
+  const w = makeWorld();
+  w.post(savePayload({ review: 'x'.repeat(500) }));
+  eq(w.sheet('Agent').rows[1][9].length, 200, 'review length');
+  const again = makeWorld();
+  again.post(savePayload({ review: '12345' }));
+  eq(again.sheet('Agent').rows[1][9], '12345', 'review cell is still text, as the mock turns number-like text into a number only in a non-text cell');
+});
+
+test('save: an old 9-column Agent tab gets the Review header in column J and its old rows are not touched', function () {
+  const w = makeWorld();
+  const old = w.addSheet('Agent', [OLD_HEADERS, oldRow('900', true), oldRow('901', false)]);
+  const before = JSON.stringify(old.rows);
+  const r = w.post(savePayload({ run_id: '1001', review: 'approved' }));
+  eq(r.success, true, 'success');
+  eq(r.row, 4, 'row number');
+  eq(old.rows[0].slice(0, 9), OLD_HEADERS, 'the old header cells');
+  eq(old.rows[0][9], 'Review', 'the new header cell');
+  eq(JSON.stringify(old.rows.slice(1, 3)), JSON.stringify([oldRow('900', true), oldRow('901', false)]), 'the old rows');
+  eq(old.rows[1].length, 9, 'an old row still has 9 cells');
+  eq(old.rows[3].length, 10, 'the new row has 10 cells');
+  eq(old.rows[3][9], 'approved', 'the new review cell');
+  const writes = w.events.filter(function (e) { return e.indexOf('range:Agent:1,') === 0; });
+  eq(writes, ['range:Agent:1,10,1,1'], 'the only header cell written is J1');
+  eq(before === JSON.stringify(old.rows), false, 'the sheet changed (sanity)');
+});
+
+test('save: the header is patched once; the next call leaves the sheet header alone', function () {
+  const w = makeWorld();
+  w.addSheet('Agent', [OLD_HEADERS, oldRow('900', true)]);
+  w.post(savePayload({ run_id: '1001' }));
+  w.events.length = 0;
+  w.post(savePayload({ run_id: '1002' }));
+  eq(w.events.filter(function (e) { return e.indexOf('range:Agent:1,') === 0; }), [], 'header ranges touched');
+});
+
+test('save: a duplicate run ID is still ignored on an old 9-column tab (the old row is found)', function () {
+  const w = makeWorld();
+  const old = w.addSheet('Agent', [OLD_HEADERS, oldRow('900', true)]);
+  const r = w.post(savePayload({ run_id: '900', review: 'approved' }));
+  eq(r, { success: true, duplicate: true }, 'reply');
+  eq(old.rows.length, 2, 'rows');
+  eq(w.mails.length, 0, 'emails sent');
+});
+
+test('save: a duplicate run ID is ignored on the 10-column layout and the first review text stays', function () {
+  const w = makeWorld();
+  w.post(savePayload({ run_id: '1001', review: 'approved' }));
+  const r = w.post(savePayload({ run_id: '1001', review: 'unconfirmed: reviewer unavailable' }));
+  eq(r, { success: true, duplicate: true }, 'reply');
+  eq(w.dataRows('Agent'), 1, 'data rows');
+  eq(w.sheet('Agent').rows[1][9], 'approved', 'review cell');
+});
+
+test('save: an Agent tab with only 9 columns in the sheet itself gets a column added first', function () {
+  const w = makeWorld();
+  const old = w.addSheet('Agent', [OLD_HEADERS, oldRow('900', true)], 9);
+  const r = w.post(savePayload({ run_id: '1001', review: 'approved' }));
+  eq(r.success, true, 'success');
+  eq(w.events.filter(function (e) { return e.indexOf('insertColumns:') === 0; }), ['insertColumns:Agent:9,1'], 'column inserted');
+  eq(old.rows[0][9], 'Review', 'header');
+  eq(old.rows[2][9], 'approved', 'review cell');
+});
+
+test('history: old 9-column rows and new 10-column rows are read alike', function () {
+  const w = makeWorld();
+  w.addSheet('Agent', [OLD_HEADERS, oldRow('900', true)]);
+  w.post(savePayload({ run_id: '1001', alert: false, coins: [], message: '', review: 'code-only: no alert drafted' }));
+  const r = w.post({ action: 'history', limit: 5 });
+  eq(r.success, true, 'success');
+  eq(r.decisions.length, 2, 'decisions');
+  eq(r.decisions[0].alert, true, 'old row alert');
+  eq(r.decisions[0].coins, ['BTC'], 'old row coins');
+  eq(r.decisions[0].message, 'BTC old alert', 'old row message');
+  eq(r.decisions[1].alert, false, 'new row alert');
+  eq(Object.keys(r.decisions[1]).sort(), ['alert', 'coins', 'message', 'sources', 'time'], 'the memory stays small');
+  const detail = w.post({ action: 'history', limit: 5, detail: true });
+  eq(detail.decisions[0].blocked_reason, '', 'detail of an old row');
+  eq(detail.decisions[1].reasoning, 'why', 'detail of a new row');
+});
+
+test('history: a read patches the header of an old tab too, and writes no row', function () {
+  const w = makeWorld();
+  const old = w.addSheet('Agent', [OLD_HEADERS, oldRow('900', true)]);
+  const r = w.post({ action: 'history', limit: 5 });
+  eq(r.success, true, 'success');
+  eq(old.rows[0][9], 'Review', 'header');
+  eq(old.rows.length, 2, 'rows');
+});
+
+test('save: the other tabs are not changed by the Review column (append still needs its own widths)', function () {
+  const w = makeWorld();
+  w.post(savePayload({ run_id: '1001', review: 'approved' }));
+  const r = w.post(appendPayload('market_data', [marketRow('1001', 'BTC')]));
+  eq(r, { success: true, added: 1, first_row: 2 }, 'reply');
+  eq(w.sheet('market_data').rows[0].length, 24, 'market_data header width');
 });
 
 // ---- run ------------------------------------------------------------------------------------------------------

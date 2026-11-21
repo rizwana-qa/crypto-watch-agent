@@ -9,11 +9,13 @@ import json
 import os
 import re
 import time
+from datetime import datetime, timezone
 
 import agent
 import sources
 
 AS_OF = "2026-11-19"
+FAKE_NOW = datetime(2026, 11, 20, 5, 17, tzinfo=timezone.utc)   # the day after AS_OF: the fake data are yesterday's, so the freshness check (R6) agrees
 
 
 def fake_market(coin, close, ret, dist, vol, dd, rank_vol, rank_dist, rank_dd, note=None,
@@ -289,7 +291,7 @@ def run_scenario(scenario, mode, use_reviewer):
     tools = fake_tools(scenario["markets"], scenario["history"], scenario.get("cross"), scenario.get("context"), scenario.get("stats"))
     calls_before, tokens_before = agent.STATS["llm_calls"], agent.STATS["llm_tokens"]
     try:
-        decision, evidence = agent.decide(mode, use_reviewer, tools)
+        decision, evidence = agent.decide(mode, use_reviewer, tools, now=FAKE_NOW)
     except agent.AgentError as error:
         return {"name": scenario["name"], "passed": False, "finished": False, "why": f"did not finish: {error}",
                 "decision": None, "expected": "", "calls": agent.STATS["llm_calls"] - calls_before,

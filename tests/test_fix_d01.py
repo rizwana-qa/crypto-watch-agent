@@ -71,10 +71,11 @@ class QuietCase(unittest.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
 
-    def run_default_path(self, tools, message, reasoning="BTC rank is at or above 95.", calls=ALL_TOOLS, **changes):
-        """agent.decide with the reviewer off, exactly as daily.yml runs it."""
+    def run_default_path(self, tools, message, reasoning="BTC rank is at or above 95.", calls=ALL_TOOLS, revisions=0, **changes):
+        """agent.decide with the AI review off. The code review still runs, and a code finding gets one revision first: `revisions` is how
+        many times the scripted AI repeats the same answer when asked to revise."""
         final = json.dumps(draft(message=message, reasoning=reasoning, **changes))
-        replies = [tool_calls(calls), {"role": "assistant", "content": final}]
+        replies = [tool_calls(calls)] + [{"role": "assistant", "content": final}] * (1 + revisions)
         with mock.patch.object(agent, "call_llm", side_effect=replies):
             return agent.decide("agent", False, tools)
 
@@ -93,13 +94,14 @@ class AuditCaseL4(QuietCase):
     def test_the_fake_numbers_are_not_in_the_evidence(self):
         _, evidence = self.run_default_path(self.tools(), "BTC moved.", calls=MARKETS_ONLY)
         found = agent.unsupported_numbers(self.FAKE + " Volatility 9.87%, 412 consecutive alert days.", agent.evidence_text(evidence))
-        self.assertEqual(sorted(set(found)), ["412", "700", "9.87", "99.9"])
+        # 700 is in the evidence now: the code adds the alert history stats, and the fake stats say 700 days ranked.
+        self.assertEqual(sorted(set(found)), ["412", "9.87", "99.9"])
 
     def test_an_alert_with_invented_numbers_is_blocked_with_the_reviewer_off(self):
-        decision, _ = self.run_default_path(self.tools(), self.FAKE, reasoning="Volatility 9.87%, 412 consecutive alert days.", calls=MARKETS_ONLY)
+        decision, _ = self.run_default_path(self.tools(), self.FAKE, reasoning="Volatility 9.87%, 412 consecutive alert days.", calls=MARKETS_ONLY, revisions=1)
         self.assertFalse(decision["alert"])
         self.assertIn(REASON, decision["blocked_reason"])
-        for number in ("9.87", "99.9", "700"):
+        for number in ("9.87", "99.9"):   # 700 is in the evidence (the fake alert history stats)
             self.assertIn(number, decision["blocked_reason"])
         self.assertNotIn("412", decision["blocked_reason"], "the reasoning is not checked, only the message")
         self.assertEqual((decision["message"], decision["coins"]), ("", []))

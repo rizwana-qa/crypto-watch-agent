@@ -349,9 +349,11 @@ class FlowsWithAScriptedAI(QuietCase):
         self.assertEqual(calls, 2)
 
     def test_loop_refuses_a_coin_that_is_not_on_the_watchlist(self):
-        replies = [tool_call_message(("get_market_summary", {"coin": "SOL"})), text_message(final_json(alert=False, coins=[], message="", sources=[]))]
-        decision, evidence, _ = self.run_mode(replies)
-        self.assertEqual(evidence, [])
+        replies = [tool_call_message(("get_market_summary", {"coin": "SOL"})),
+                   text_message(final_json(alert=False, coins=[], message="", sources=[], reasoning="No coin could be read, so there is no alert."))]
+        decision, evidence, _ = self.run_mode(replies, tools=self.tools(scenarios.calm()))
+        self.assertNotIn("SOL", [e["args"].get("coin") for e in evidence])   # the blocked call left nothing in the evidence
+        self.assertEqual([e["args"]["coin"] for e in evidence if e["tool"] == "get_market_summary"], list(agent.WATCHLIST))   # the code added the real coins
         self.assertFalse(decision["alert"])
 
     def test_loop_stops_with_an_error_at_the_step_limit(self):
@@ -374,9 +376,12 @@ class FlowsWithAScriptedAI(QuietCase):
         self.assertIn("source", decision["blocked_reason"])
 
     def test_an_ai_that_gives_advice_cannot_get_an_alert_through(self):
-        decision, _, _ = self.run_mode([all_tool_calls(), text_message(final_json(message="BTC dropped 12.4%, buy the dip."))])
+        # The advice is a code finding (R2), so the agent gets its one revision first. A model that repeats the advice is still blocked.
+        advice = text_message(final_json(message="BTC dropped 12.4%, buy the dip."))
+        decision, _, calls = self.run_mode([all_tool_calls(), advice, advice])
         self.assertFalse(decision["alert"])
         self.assertIn("advice", decision["blocked_reason"])
+        self.assertEqual(calls, 3)  # loop 2 + the one revision, no review call
 
     # ---- planner
     def plan(self, **changes):
@@ -388,7 +393,8 @@ class FlowsWithAScriptedAI(QuietCase):
     def test_planner_code_runs_every_step_then_the_ai_decides(self):
         decision, evidence, calls = self.run_mode([text_message(self.plan()), text_message(final_json(sources=["Alert rules"]))], mode="planner")
         self.assertTrue(decision["alert"])
-        self.assertEqual(len(evidence), 5)
+        self.assertEqual(len(evidence), 8)   # the 5 planned steps and the 3 data tools that the plan left out, added by the code
+        self.assertEqual([e["tool"] for e in evidence[5:]], ["get_cross_asset_summary", "get_market_context", "get_alert_history_stats"])
         self.assertEqual(calls, 2)  # one plan, one decision: the AI never ran a tool
 
     def test_planner_gets_one_retry_for_a_bad_plan(self):
@@ -423,11 +429,11 @@ class FlowsWithAScriptedAI(QuietCase):
 
     def test_reviewer_problem_leads_to_exactly_one_revision(self):
         replies = [all_tool_calls(), text_message(final_json()),
-                   text_message(json.dumps({"approved": False, "problems": ["rank 99.3 is not in the evidence"]})),
-                   text_message(final_json(alert=False, coins=[], message="", sources=["Alert rules"]))]
+                   text_message(json.dumps({"approved": False, "codes": ["UNSUPPORTED_CLAIM"], "notes": ["rank 99.3 is not shown"]})),
+                   text_message(final_json(alert=False, coins=[], message="", sources=["Alert rules"], reasoning="BTC rank 99.3 is at or above 95 but not shown."))]
         decision, _, calls = self.run_mode(replies, reviewer=True)
         self.assertFalse(decision["alert"])
-        self.assertEqual(calls, 4)  # loop 2 + review 1 + one revision, no second review
+        self.assertEqual(calls, 4)  # loop 2 + review 1 + one revision (a calm revision needs no second review)
 
     def test_reviewer_approval_keeps_the_draft(self):
         replies = [all_tool_calls(), text_message(final_json(sources=["Volatility rule"])), text_message(json.dumps({"approved": True, "problems": []}))]
@@ -436,14 +442,17 @@ class FlowsWithAScriptedAI(QuietCase):
         self.assertEqual(calls, 3)
 
     def test_a_broken_reviewer_reply_never_blocks_the_job(self):
+        # The alert still goes out, but labelled UNCONFIRMED: nobody confirmed it.
         for reply in (text_message("I refuse to answer"), text_message(""), text_message('{"approved": "maybe"}')):
             decision, _, _ = self.run_mode([all_tool_calls(), text_message(final_json()), reply], reviewer=True)
             self.assertTrue(decision["alert"])
+            self.assertTrue(decision["message"].startswith("UNCONFIRMED: "))
 
     def test_a_failed_reviewer_call_never_blocks_the_job(self):
         replies = [all_tool_calls(), text_message(final_json()), agent.AgentError("Groq error 500")]
         decision, _, _ = self.run_mode(replies, reviewer=True)
         self.assertTrue(decision["alert"])
+        self.assertTrue(decision["message"].startswith("UNCONFIRMED: "))
 
     def test_code_guardrails_still_apply_after_a_reviewer_that_approves_everything(self):
         approve = text_message(json.dumps({"approved": True, "problems": []}))
@@ -451,9 +460,11 @@ class FlowsWithAScriptedAI(QuietCase):
         self.assertFalse(decision["alert"])
 
     def test_a_bad_revision_keeps_the_first_draft(self):
-        verdict = text_message(json.dumps({"approved": False, "problems": ["x"]}))
+        # A reviewer that rejects the first draft and a revision that is not usable: the first draft is kept, and it is blocked.
+        verdict = text_message(json.dumps({"approved": False, "codes": ["OVERSTATED"], "notes": ["x"]}))
         decision, _, _ = self.run_mode([all_tool_calls(), text_message(final_json()), verdict, text_message("broken")], reviewer=True)
-        self.assertTrue(decision["alert"])
+        self.assertFalse(decision["alert"])
+        self.assertEqual(decision["blocked_reason"], "reviewer: OVERSTATED")
 
     def test_planner_and_reviewer_combine(self):
         replies = [text_message(self.plan()), text_message(final_json()), text_message(json.dumps({"approved": True, "problems": []}))]

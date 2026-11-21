@@ -58,8 +58,11 @@ class D02Case(unittest.TestCase):
 
 class MissedBreachIsFlagged(D02Case):
     def test_l2_no_tool_calls_and_no_alert_is_flagged_as_unverified(self):
-        decision, evidence, logs = self.go([text_message(final_json())])
-        self.assertEqual(evidence, [])
+        # The AI makes no tool call. The code now completes the evidence itself, so "no market data" means that the data tools all failed.
+        outage = {coin: scenarios.outage(coin) for coin in agent.WATCHLIST}
+        decision, evidence, logs = self.go([text_message(final_json())], markets=outage)
+        self.assertEqual([e["tool"] for e in evidence].count("get_market_summary"), 3)
+        self.assertTrue(all("error" in e["result"] for e in evidence if e["tool"] == "get_market_summary"))
         self.assertEqual(len(warnings(logs)), 1)
         self.assertIn("no valid market data", warnings(logs)[0])
         self.assertTrue(decision["check"].startswith("unverified"), decision["check"])
@@ -69,7 +72,7 @@ class MissedBreachIsFlagged(D02Case):
         self.assertEqual(decision["blocked_reason"], "")
 
     def test_l3_btc_at_the_alert_rank_but_the_ai_says_no_alert_is_flagged(self):
-        decision, _, logs = self.go([READ_MARKETS, text_message(final_json())], markets=scenarios.btc_spike(scenarios.calm()))
+        decision, _, logs = self.go([READ_MARKETS, text_message(final_json()), text_message(final_json())], markets=scenarios.btc_spike(scenarios.calm()))
         self.assertEqual(len(warnings(logs)), 1)
         self.assertIn("BTC", warnings(logs)[0])
         self.assertEqual(decision["code_breaches"], ["BTC"])
@@ -80,16 +83,19 @@ class MissedBreachIsFlagged(D02Case):
     def test_several_coins_are_all_named(self):
         markets = scenarios.btc_spike(scenarios.calm())
         markets["ETH"] = scenarios.fake_market("ETH", 2800.0, -9.0, -8.0, 4.0, -12.0, 97.0, 96.0, 98.0)
-        decision, _, logs = self.go([READ_MARKETS, text_message(final_json())], markets=markets)
+        decision, _, logs = self.go([READ_MARKETS, text_message(final_json()), text_message(final_json())], markets=markets)
         self.assertEqual(decision["code_breaches"], ["BTC", "ETH"])
         self.assertEqual(decision["check"], "mismatch: BTC, ETH at the alert rank, AI said no alert")
         self.assertIn("BTC, ETH", warnings(logs)[0])
 
     def test_planner_mode_is_checked_too(self):
+        # The plan holds no data step. The code completes the evidence, finds BTC at the alert rank, the one revision does not change the answer.
         plan = json.dumps({"steps": [{"tool": "search_playbook", "args": {"query": "alert rules"}, "reason": "rules"}]})
-        decision, _, logs = self.go([text_message(plan), text_message(final_json())], mode="planner")
+        decision, _, logs = self.go([text_message(plan), text_message(final_json()), text_message(final_json())],
+                                    markets=scenarios.btc_spike(scenarios.calm()), mode="planner")
         self.assertEqual(len(warnings(logs)), 1)
-        self.assertTrue(decision["check"].startswith("unverified"), decision["check"])
+        self.assertTrue(decision["check"].startswith("mismatch"), decision["check"])
+        self.assertEqual(decision["code_breaches"], ["BTC"])
 
     def test_all_market_tools_failing_counts_as_no_market_data(self):
         markets = {coin: scenarios.outage(coin) for coin in agent.WATCHLIST}
@@ -130,7 +136,7 @@ class AgreeingRunsStaySilent(D02Case):
     def test_a_new_coin_at_the_alert_rank_is_still_a_miss_when_another_coin_was_alerted(self):
         markets = scenarios.btc_spike(scenarios.calm())
         markets["XRP"] = scenarios.fake_market("XRP", 1.9, -9.0, -8.0, 4.0, -12.0, 97.0, 96.0, 98.0)
-        decision, _, logs = self.go([READ_MARKETS_AND_HISTORY, text_message(final_json())], markets=markets, history=[scenarios.YESTERDAY_ALERT])
+        decision, _, logs = self.go([READ_MARKETS_AND_HISTORY, text_message(final_json()), text_message(final_json())], markets=markets, history=[scenarios.YESTERDAY_ALERT])
         self.assertEqual(decision["code_breaches"], ["BTC", "XRP"])
         self.assertEqual(decision["check"], "mismatch: XRP at the alert rank, AI said no alert")
         self.assertEqual(len(warnings(logs)), 1)
@@ -148,7 +154,7 @@ class AlertedCoinWithoutARank(D02Case):
 
 class NothingElseChanges(D02Case):
     def test_the_sheet_payload_has_the_same_fields_with_or_without_the_new_keys(self):
-        decision, _, _ = self.go([READ_MARKETS, text_message(final_json())], markets=scenarios.btc_spike(scenarios.calm()))
+        decision, _, _ = self.go([READ_MARKETS, text_message(final_json()), text_message(final_json())], markets=scenarios.btc_spike(scenarios.calm()))
         self.assertIn("check", decision)
         bare = {k: v for k, v in decision.items() if k not in ("check", "code_breaches")}
         sent = []
@@ -163,15 +169,15 @@ class NothingElseChanges(D02Case):
                 agent.deliver(item, "Agent loop")
                 sent.append(post.call_args.kwargs["json"])
         self.assertEqual(sent[0], sent[1])
-        self.assertEqual(set(sent[0]), {"action", "time", "version", "run_id", "alert", "coins", "message", "sources", "reasoning", "blocked_reason"})
+        self.assertEqual(set(sent[0]), {"action", "time", "version", "run_id", "alert", "coins", "message", "sources", "reasoning", "blocked_reason", "review"})
 
     def test_the_decision_is_still_json_serialisable_for_the_log_line(self):
-        decision, _, _ = self.go([READ_MARKETS, text_message(final_json())], markets=scenarios.btc_spike(scenarios.calm()))
+        decision, _, _ = self.go([READ_MARKETS, text_message(final_json()), text_message(final_json())], markets=scenarios.btc_spike(scenarios.calm()))
         self.assertEqual(json.loads(json.dumps(decision))["code_breaches"], ["BTC"])
 
     def test_the_warning_text_has_no_dash_or_advice_wording(self):
-        _, _, logs = self.go([READ_MARKETS, text_message(final_json())], markets=scenarios.btc_spike(scenarios.calm()))
-        _, _, logs_empty = self.go([text_message(final_json())])
+        _, _, logs = self.go([READ_MARKETS, text_message(final_json()), text_message(final_json())], markets=scenarios.btc_spike(scenarios.calm()))
+        _, _, logs_empty = self.go([text_message(final_json())], markets={coin: scenarios.outage(coin) for coin in agent.WATCHLIST})
         self.assertEqual((len(warnings(logs)), len(warnings(logs_empty))), (1, 1))
         for line in warnings(logs) + warnings(logs_empty):
             self.assertNotIn("—", line)
