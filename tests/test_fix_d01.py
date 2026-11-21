@@ -11,7 +11,7 @@ import json
 import math
 import sys
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -19,6 +19,19 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import agent  # noqa: E402
 import scenarios  # noqa: E402
+
+
+# The fake market data are dated 2026-11-19. The freshness check (R6) blocks an alert on data that are not the latest completed day, so these
+# tests run on the scenarios' fake clock, as the scenarios do. The tests that call decide() with their own clock are not affected.
+_CLOCK = mock.patch.object(agent, "utc_now", lambda: scenarios.FAKE_NOW)
+
+
+def setUpModule():
+    _CLOCK.start()
+
+
+def tearDownModule():
+    _CLOCK.stop()
 
 TITLES = [section["title"] for section in agent.load_playbook()]
 DAY = 86400
@@ -76,8 +89,10 @@ class QuietCase(unittest.TestCase):
         many times the scripted AI repeats the same answer when asked to revise."""
         final = json.dumps(draft(message=message, reasoning=reasoning, **changes))
         replies = [tool_calls(calls)] + [{"role": "assistant", "content": final}] * (1 + revisions)
+        # The clock is the day after the data (the fixtures end on 2026-11-19 or on 2026-11-20), so the freshness check (R6) sees the latest day.
+        day = datetime.strptime(tools["get_market_summary"]("BTC")["as_of"], "%Y-%m-%d").replace(hour=5, minute=17, tzinfo=timezone.utc)
         with mock.patch.object(agent, "call_llm", side_effect=replies):
-            return agent.decide("agent", False, tools)
+            return agent.decide("agent", False, tools, now=day + timedelta(days=1))
 
 
 class AuditCaseL4(QuietCase):

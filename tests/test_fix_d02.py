@@ -18,6 +18,19 @@ import agent  # noqa: E402
 import scenarios  # noqa: E402
 
 
+# The fake market data are dated 2026-11-19. The freshness check (R6) blocks an alert on data that are not the latest completed day, so these
+# tests run on the scenarios' fake clock, as the scenarios do. The tests that call decide() with their own clock are not affected.
+_CLOCK = mock.patch.object(agent, "utc_now", lambda: scenarios.FAKE_NOW)
+
+
+def setUpModule():
+    _CLOCK.start()
+
+
+def tearDownModule():
+    _CLOCK.stop()
+
+
 def tool_call_message(*calls):
     return {"role": "assistant", "content": None, "tool_calls": [
         {"id": f"call{i}", "type": "function", "function": {"name": name, "arguments": json.dumps(args)}}
