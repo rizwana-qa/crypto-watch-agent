@@ -4,6 +4,7 @@
 """
 
 import http.client
+import io
 import json
 import sys
 import tempfile
@@ -46,6 +47,14 @@ class Retrieval(unittest.TestCase):
     def test_every_check_passes(self):
         failed = [text for passed, text in rag.run_checks(INDEX) if not passed]
         self.assertEqual(failed, [])
+
+    def test_the_check_run_has_a_refusal_section_that_reaches_every_reason_code(self):
+        results = rag.run_checks(INDEX)
+        self.assertGreater(len(results), 26)                       # 26 retrieval checks before the refusal section was added
+        text = "\n".join(t for _, t in results)
+        for code in rag.REASON_TEXT:
+            self.assertIn(code, text, code)
+        self.assertIn("every reason code is reached at least once", text)
 
     def test_first_hit_is_right_for_nearly_every_check(self):
         first = sum(1 for q, section in rag.CHECKS if titles(q)[:1] == [section])
@@ -141,6 +150,7 @@ class Answers(unittest.TestCase):
         llm = fake(self.good())
         out = rag.ask(NEAR, INDEX, llm=llm)
         self.assertEqual(out["kind"], "answer")
+        self.assertEqual((out["reason"], out["reason_text"]), ("", ""))       # a normal answer has no reason
         self.assertTrue(out["used_ai"])
         self.assertEqual((out["guardrails"]["passed"], out["guardrails"]["total"]), (4, 4))
         self.assertEqual([w["section"] for w in out["why"]], ["Alert rules"])
@@ -179,6 +189,7 @@ class Answers(unittest.TestCase):
         data = self.good(why=[{"text": "Made up.", "section": "Moon phases"}])
         out = rag.ask(NEAR, INDEX, llm=fake(data))
         self.assertEqual(out["kind"], "retrieval")
+        self.assertEqual(out["reason"], "ai_no_citation")
         self.assertFalse(out["used_ai"])
         self.assertIn("no valid citation", out["note"])
         self.assertTrue(out["why"])
@@ -187,6 +198,7 @@ class Answers(unittest.TestCase):
         data = self.good(bottom_line="You should buy when a coin is near threshold.")
         out = rag.ask(NEAR, INDEX, llm=fake(data))
         self.assertEqual(out["kind"], "retrieval")
+        self.assertEqual(out["reason"], "ai_withheld_advice")
         self.assertFalse(out["used_ai"])
         self.assertIn("withheld", out["note"])
         self.assertFalse(out["guardrails"]["checks"][1]["passed"])
@@ -210,6 +222,7 @@ class Answers(unittest.TestCase):
             raise agent.AgentError("GROQ_API_KEY is not set")
         out = rag.ask(NEAR, INDEX, llm=broken)
         self.assertEqual(out["kind"], "retrieval")
+        self.assertEqual(out["reason"], "ai_unavailable")
         self.assertIn("not used", out["note"])
 
     def test_json_in_a_code_fence_is_accepted(self):
@@ -219,6 +232,7 @@ class Answers(unittest.TestCase):
     def test_not_in_the_playbook_is_stated_without_evidence(self):
         out = rag.ask(NEAR, INDEX, llm=fake({"bottom_line": rag.NOT_IN_PLAYBOOK, "why": []}))
         self.assertEqual(out["kind"], "not_in_playbook")
+        self.assertEqual(out["reason"], "not_in_playbook")
         self.assertEqual((out["why"], out["evidence"]), ([], []))
         self.assertTrue(out["used_ai"])
 
@@ -227,6 +241,7 @@ class Answers(unittest.TestCase):
             out = rag.ask(question, INDEX, llm=never_called)
             self.assertEqual(out["kind"], "declined", question)
             self.assertEqual(out["why"][0]["section"], "Wording rules")
+            self.assertIn(out["reason"], ("advice_request", "price_forecast"), question)
             self.assertFalse(out["used_ai"])
 
     def test_questions_about_the_rules_are_not_declined(self):
@@ -236,11 +251,13 @@ class Answers(unittest.TestCase):
     def test_no_match_is_stated_and_the_ai_is_not_called(self):
         out = rag.ask("zzz qqq xxx", INDEX, llm=never_called)
         self.assertEqual(out["kind"], "no_match")
+        self.assertEqual(out["reason"], "off_topic")
         self.assertEqual(out["bottom_line"], rag.NOT_IN_PLAYBOOK)
 
     def test_with_the_ai_off_only_the_playbook_text_is_shown(self):
         out = rag.ask(NEAR, INDEX, llm=never_called, ai=False)
         self.assertEqual(out["kind"], "retrieval")
+        self.assertEqual(out["reason"], "ai_off")
         self.assertFalse(out["used_ai"])
         self.assertTrue(out["why"] and out["evidence"])
         for item in out["why"]:
@@ -248,7 +265,9 @@ class Answers(unittest.TestCase):
 
     def test_a_blank_question_is_an_error_not_a_crash(self):
         for question in ("", "  ", "a", None):
-            self.assertEqual(rag.ask(question, INDEX, llm=never_called)["kind"], "error")
+            out = rag.ask(question, INDEX, llm=never_called)
+            self.assertEqual((out["kind"], out["reason"]), ("error", "empty_question"))
+            self.assertEqual(out["reason_text"], rag.REASON_TEXT["empty_question"])
 
     def test_a_long_question_is_cut(self):
         llm = fake(self.good())
@@ -278,6 +297,8 @@ class Answers(unittest.TestCase):
 class Server(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
+        cls.quiet = mock.patch("sys.stderr", io.StringIO())      # the server writes one [ask] line per question; keep the test output clean
+        cls.quiet.start()
         cls.llm = fake(Answers().good())
         cls.server = rag_server.make_server(0, ai=True, llm=cls.llm, index=INDEX)
         cls.port = cls.server.server_address[1]
@@ -287,6 +308,7 @@ class Server(unittest.TestCase):
     def tearDownClass(cls):
         cls.server.shutdown()
         cls.server.server_close()
+        cls.quiet.stop()
 
     def call(self, method, path, body=None, headers=None):
         conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
@@ -304,6 +326,7 @@ class Server(unittest.TestCase):
 
     def setUp(self):
         self.server._asked.clear()
+        self.llm_calls_before = len(self.llm.calls)
 
     def test_it_listens_on_this_computer_only(self):
         self.assertEqual(self.server.server_address[0], "127.0.0.1")
@@ -342,6 +365,14 @@ class Server(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(data["kind"], "answer")
         self.assertEqual(data["guardrails"]["passed"], 4)
+        self.assertEqual((data["reason"], data["reason_text"]), ("", ""))
+
+    def test_a_refused_question_comes_back_with_its_reason(self):
+        status, _, body = self.post({"question": "What is the price of BTC right now?"})
+        data = json.loads(body)
+        self.assertEqual((status, data["kind"], data["reason"]), (200, "declined", "live_data_request"))
+        self.assertEqual(data["reason_text"], rag.REASON_TEXT["live_data_request"])
+        self.assertEqual(len(self.llm.calls), self.llm_calls_before)       # the AI was not called for it
 
     def test_the_key_is_never_in_a_reply(self):
         with mock.patch.dict("os.environ", {"GROQ_API_KEY": "gsk_secret_value_123"}):

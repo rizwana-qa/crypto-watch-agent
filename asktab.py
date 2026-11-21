@@ -5,8 +5,9 @@ rag_static.js is a line-for-line port of the retrieval half of rag.py, and the p
 It shows the playbook's own words (a sentence picked by code, plus the full section on demand). It never writes an answer with AI.
 AI-written answers stay on the local page (start_ask_page.bat), because a key must never be put into a file that can be forwarded.
 
-rag.py is the source of truth. This module hands the browser the same constants, stopwords, synonyms, advice pattern and sections,
-and tests/test_asktab.py runs both engines on the same questions and requires the same answers.
+rag.py is the source of truth. This module hands the browser the same constants, stopwords, synonyms, refusal patterns (advice, forecast,
+live data, personal account, secrets), reason texts and sections, and tests/test_asktab.py runs both engines on the same questions and
+requires the same answers, kind and reason included.
 """
 import html
 import json
@@ -35,6 +36,12 @@ def data(index=None):
         "stopwords": sorted(rag.STOPWORDS),
         "synonyms": {word: list(extra) for word, extra in rag.QUERY_SYNONYMS.items()},
         "advice": {"source": rag.ADVICE_REQUEST_RE.pattern, "flags": "i"},
+        "advice_only": {"source": rag.ADVICE_ONLY_RE.pattern, "flags": "i"},      # the rest of the advice pattern is a forecast
+        "personal": {"source": rag.PERSONAL_RE.pattern, "flags": "i"},
+        "live": {"sources": [p.pattern for p in rag.LIVE_DATA_RES], "flags": "i"},
+        "security": {"sources": [p.pattern for p in rag.SECURITY_RES], "flags": "i"},
+        "reasons": dict(rag.REASON_TEXT),
+        "refused": dict(rag.REFUSED_LINE),
         "declined": list(rag.DECLINED),
         "not_in_playbook": rag.NOT_IN_PLAYBOOK,
         "related": rag.RELATED,
@@ -101,6 +108,8 @@ CSS = """
 .ref dt{color:var(--muted)}.ref dd{margin:0;text-align:right;font-family:"JetBrains Mono",ui-monospace,Menlo,monospace;color:var(--text)}
 .words{display:flex;flex-wrap:wrap;gap:6px;margin-top:10px}
 .words span{font-family:"JetBrains Mono",ui-monospace,Menlo,monospace;font-size:12px;padding:2px 8px;border-radius:4px;background:#1A2231;color:var(--soft)}
+#ask-answer .reason{margin:12px 0 4px;padding:10px 14px;border-left:4px solid var(--amber);background:rgba(246,183,60,.10);border-radius:4px;font-size:15px;line-height:1.5;color:var(--text)}
+#ask-answer .reason b{font-weight:700;color:var(--amber);margin-right:4px}
 @media print{.tabbar{display:none}}
 """
 

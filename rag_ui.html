@@ -72,6 +72,8 @@ main.wrap{padding-top:40px;padding-bottom:56px}
 .guards{display:flex;flex-wrap:wrap;gap:8px 18px;font-size:13px;color:var(--muted)}
 .guards .ok{color:var(--green)}.guards .bad{color:var(--neg)}
 .note{font-size:13px;color:var(--amber);background:rgba(246,183,60,.08);border-left:3px solid var(--amber);padding:10px 14px;border-radius:4px}
+.reason{font-size:15px;line-height:1.5;color:var(--text);background:rgba(246,183,60,.10);border-left:4px solid var(--amber);padding:10px 14px;border-radius:4px;margin:0}
+.reason b{font-weight:700;color:var(--amber);margin-right:4px}
 .actions{display:flex;flex-wrap:wrap;gap:10px}
 .related{display:flex;flex-wrap:wrap;gap:8px}
 .side{display:flex;flex-direction:column;gap:16px;min-width:0}
@@ -207,15 +209,23 @@ Live market-data analysis and decision support. Not investment advice: answers d
     var words = el("div", "words"); r.banned_words.forEach(function (w) { words.appendChild(el("span", "", w)); }); box.appendChild(words);
   }
 
+  function reasonLine(text) {
+    var line = el("p", "reason"); line.appendChild(el("b", "", "Why:")); line.appendChild(document.createTextNode(" " + text)); return line;
+  }
+
   function render(a) {
     state.last = a;
     $("qtitle").textContent = a.question;
     var res = $("result"); clear(res);
     var wrap = el("div", "fade"); wrap.style.display = "flex"; wrap.style.flexDirection = "column"; wrap.style.gap = "22px";
-    if (a.note) wrap.appendChild(el("div", "note", a.note));
+    // the reason line already says what the note says, except when the AI failed and the note names the error
+    if (a.note && (!a.reason_text || a.reason === "ai_unavailable")) wrap.appendChild(el("div", "note", a.note));
     var bottom = el("div", "bottom"); bottom.appendChild(el("span", "cap", "Bottom line")); bottom.appendChild(el("p", "", a.bottom_line)); wrap.appendChild(bottom);
+    // "Why: <reason>" for every answer that is not a normal answer. The word and the amber bar are both there, so it is never colour alone.
+    // It is inside the live region (#center), so a screen reader announces it together with the answer, like the note.
+    if (a.reason_text && a.kind !== "answer") { wrap.appendChild(reasonLine(a.reason_text)); }
     if (a.why && a.why.length) {
-      var box = el("div"); box.appendChild(el("span", "cap", a.kind === "retrieval" ? "From the playbook" : "Why"));
+      var box = el("div"); box.appendChild(el("span", "cap", a.kind === "retrieval" ? "From the playbook" : (a.kind === "declined" ? "The rule behind this" : "Why")));
       var ol = el("ol", "why");
       a.why.forEach(function (w, i) {
         var li = el("li"); li.appendChild(el("span", "n", String(i + 1).padStart(2, "0")));
@@ -259,6 +269,7 @@ Live market-data analysis and decision support. Not investment advice: answers d
   function copyBrief(button) {
     var a = state.last; if (!a) return;
     var lines = [a.question, "", "Bottom line: " + a.bottom_line];
+    if (a.reason_text && a.kind !== "answer") lines.push("Reason: " + a.reason_text);
     if (a.why && a.why.length) { lines.push("", "Why:"); a.why.forEach(function (w) { lines.push("- " + w.text + " [" + w.section + "]"); }); }
     lines.push("", "Created by Rizwana Zahoor. Describes the playbook; not investment advice.");
     var text = lines.join("\n");

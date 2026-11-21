@@ -193,7 +193,7 @@ class BrowserEngineAgrees(unittest.TestCase):
     def test_zero_differences_with_python(self):
         for question, got, hits in zip(self.QUESTIONS, self.js["answers"], self.js["hits"]):
             want = rag.ask(question, INDEX, ai=False)
-            for key in ("kind", "bottom_line", "why", "evidence"):
+            for key in ("kind", "reason", "bottom_line", "why", "evidence"):
                 self.assertEqual(got[key], want[key], f"{key} differs for {question!r}")
             self.assertEqual([h["title"] for h in hits], titles(question), question)
 

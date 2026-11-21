@@ -20,6 +20,7 @@ import agent  # noqa: E402
 import asktab  # noqa: E402
 import rag  # noqa: E402
 import report  # noqa: E402
+from rag_reason_cases import REFUSED, STILL_ANSWERED  # noqa: E402
 from test_report import make_data  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -33,7 +34,8 @@ EXTRA = [
     "What is the alert rank?", "tell me about DVOL", "how many candles are needed", "open interest and funding",
 ]
 TOPIC_QUESTIONS = [asktab.topic_question(t["title"]) for t in rag.topics(INDEX)]
-QUESTIONS = [q for q, _ in rag.CHECKS] + rag.NO_MATCH + rag.DECLINE + TOPIC_QUESTIONS + EXTRA
+REASON_QUESTIONS = [q for q, _ in REFUSED] + STILL_ANSWERED      # the reason codes: refused by code, and the tricky ones still answered
+QUESTIONS = [q for q, _ in rag.CHECKS] + rag.NO_MATCH + rag.DECLINE + TOPIC_QUESTIONS + EXTRA + REASON_QUESTIONS
 TEXTS = [s["title"] + "\n" + s["text"] for s in INDEX.sections] + QUESTIONS
 
 
@@ -55,12 +57,27 @@ class SameAsPython(unittest.TestCase):
     def test_every_question_gets_the_same_answer_as_in_rag_py(self):
         for question, got in zip(QUESTIONS, self.js["answers"]):
             want = rag.ask(question, INDEX, ai=False)
-            for key in ("question", "kind", "bottom_line", "why", "related", "evidence"):
+            for key in ("question", "kind", "reason", "reason_text", "bottom_line", "why", "related", "evidence"):
                 self.assertEqual(got[key], want[key], f"{key} differs for {question!r}")
             if want["kind"] != "retrieval":     # the note on a retrieval answer says "no AI in this tab" instead of "AI answers are off"
                 self.assertEqual(got["note"], want["note"], f"note differs for {question!r}")
             else:
                 self.assertTrue(got["note"])
+
+    def test_every_new_reason_question_gets_the_same_kind_and_reason_in_the_browser(self):
+        by_question = dict(zip(QUESTIONS, self.js["answers"]))
+        for question, code in REFUSED:
+            self.assertEqual((by_question[question]["kind"], by_question[question]["reason"]), ("declined", code), question)
+            self.assertEqual(by_question[question]["reason"], rag.ask(question, INDEX, ai=False)["reason"], question)
+        for question in STILL_ANSWERED:
+            self.assertEqual((by_question[question]["kind"], by_question[question]["reason"]), ("retrieval", "ai_off"), question)
+
+    def test_empty_and_off_topic_questions_carry_their_reason_in_the_browser(self):
+        by_question = dict(zip(QUESTIONS, self.js["answers"]))
+        for question in ("", "   ", "ab"):
+            self.assertEqual((by_question[question]["kind"], by_question[question]["reason"]), ("error", "empty_question"), question)
+        for question in rag.NO_MATCH:
+            self.assertEqual((by_question[question]["kind"], by_question[question]["reason"]), ("no_match", "off_topic"), question)
 
     def test_the_ranked_sections_and_scores_match(self):
         for question, got in zip(QUESTIONS, self.js["hits"]):
@@ -102,6 +119,12 @@ class Data(unittest.TestCase):
                                        "title_repeat": rag.TITLE_REPEAT, "max_question": rag.MAX_QUESTION})
         self.assertEqual(d["stopwords"], sorted(rag.STOPWORDS))
         self.assertEqual(d["advice"]["source"], rag.ADVICE_REQUEST_RE.pattern)
+        self.assertEqual(d["advice_only"]["source"], rag.ADVICE_ONLY_RE.pattern)
+        self.assertEqual(d["personal"]["source"], rag.PERSONAL_RE.pattern)
+        self.assertEqual(d["live"]["sources"], [p.pattern for p in rag.LIVE_DATA_RES])
+        self.assertEqual(d["security"]["sources"], [p.pattern for p in rag.SECURITY_RES])
+        self.assertEqual(d["reasons"], rag.REASON_TEXT)
+        self.assertEqual(d["refused"], rag.REFUSED_LINE)
         self.assertEqual(len(d["sections"]), 18)
         self.assertEqual([s["title"] for s in d["sections"]], [s["title"] for s in INDEX.sections])
 

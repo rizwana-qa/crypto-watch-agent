@@ -1,8 +1,12 @@
 /* Ask the playbook, in the browser: the retrieval half of rag.py, ported line by line. No AI, no network, no key.
  *
- * rag.py is the source of truth. asktab.py hands this file the same constants, stopwords, synonyms, advice pattern and playbook
- * sections that rag.py uses, and tests/test_asktab.py runs both on the same questions and requires identical answers.
+ * rag.py is the source of truth. asktab.py hands this file the same constants, stopwords, synonyms, refusal patterns, reason texts and
+ * playbook sections that rag.py uses, and tests/test_asktab.py runs both on the same questions and requires identical answers,
+ * the kind and the reason code included.
  * Plain ES2015 on purpose: no regex look-behind and no newer syntax, so it also runs in older phone browsers.
+ *
+ * No log line is written here. rag.py and rag_server.py write "[ask] kind=... reason=..." to stderr, but this engine runs in the
+ * reader's own browser and makes no network call, so nothing a reader types ever leaves the page. That is on purpose.
  */
 (function (root) {
   "use strict";
@@ -11,6 +15,10 @@
     var cfg = data.config;
     var stop = new Set(data.stopwords);
     var advice = new RegExp(data.advice.source, data.advice.flags);
+    var adviceOnly = new RegExp(data.advice_only.source, data.advice_only.flags);   // an advice match that is not this one is a forecast
+    var personal = new RegExp(data.personal.source, data.personal.flags);
+    var live = data.live.sources.map(function (p) { return new RegExp(p, data.live.flags); });
+    var security = data.security.sources.map(function (p) { return new RegExp(p, data.security.flags); });
     var sections = data.sections;
 
     function stem(word) {
@@ -121,37 +129,57 @@
       return out;
     }
 
-    function answer(question, kind, bottomLine, why, hits, note) {
+    function reasonText(code) {
+      return code && Object.prototype.hasOwnProperty.call(data.reasons, code) ? data.reasons[code] : "";
+    }
+
+    function anyMatch(list, text) {
+      for (var i = 0; i < list.length; i++) { if (list[i].test(text)) { return true; } }
+      return false;
+    }
+
+    // The reason code when the question is declined before any search, or an empty string. Same order as refusal_code in rag.py.
+    function refusalCode(question) {
+      if (anyMatch(security, question)) { return "security_request"; }
+      if (advice.test(question)) { return adviceOnly.test(question) ? "advice_request" : "price_forecast"; }
+      if (personal.test(question)) { return "personal_account"; }
+      if (anyMatch(live, question)) { return "live_data_request"; }
+      return "";
+    }
+
+    function answer(question, kind, bottomLine, why, hits, note, reason) {
       var key = why.length ? why[0].section : (hits.length ? hits[0].title : "");
       var related = (Object.prototype.hasOwnProperty.call(data.related, key) ? data.related[key] : data.default_related)
         .filter(function (q) { return bare(q) !== bare(question); });
       var cited = why.length ? why.map(function (w) { return w.section; }) : null;
       return { question: question, kind: kind, bottom_line: bottomLine, why: why, related: related,
-               evidence: hits.length ? evidence(hits, question, cited) : [], note: note || "" };
+               evidence: hits.length ? evidence(hits, question, cited) : [], note: note || "", reason: reason || "", reason_text: reasonText(reason) };
     }
 
     function ask(raw) {
       var question = cleanQuestion(raw);
       if (question.length < 3) {
         return { question: question, kind: "error", bottom_line: "Type a question about the playbook.", why: [],
-                 related: data.default_related.slice(), evidence: [], note: "" };
+                 related: data.default_related.slice(), evidence: [], note: "", reason: "empty_question", reason_text: reasonText("empty_question") };
       }
-      if (advice.test(question)) {
+      var code = refusalCode(question);
+      if (code === "advice_request" || code === "price_forecast") {
         var wording = sections.filter(function (s) { return s.title === "Wording rules"; });
         var hits0 = wording.length ? [{ title: wording[0].title, text: wording[0].text, score: 0, order: 0 }] : [];
         var why0 = hits0.length ? [{ text: data.declined[1], section: "Wording rules" }] : [];
-        return answer(question, "declined", data.declined[0], why0, hits0, "");
+        return answer(question, "declined", data.declined[0], why0, hits0, "", code);
       }
+      if (code) { return answer(question, "declined", data.refused[code], [], [], "", code); }
       var hits = search(question);
       if (!hits.length) {
-        return answer(question, "no_match", data.not_in_playbook, [], [], "No section of the playbook matches these words. Try other words.");
+        return answer(question, "no_match", data.not_in_playbook, [], [], "No section of the playbook matches these words. Try other words.", "off_topic");
       }
       var why = hits.slice(0, 3).map(function (h) { return { text: quoteFor(h, question), section: h.title }; });
       return answer(question, "retrieval", "The closest playbook section is " + hits[0].title + ".", why, hits,
-                    "No AI is used in this tab. It shows the matching playbook text, found by code.");
+                    "No AI is used in this tab. It shows the matching playbook text, found by code.", "ai_off");
     }
 
-    return { ask: ask, search: search, terms: terms, stem: stem, sentences: sentences };
+    return { ask: ask, search: search, terms: terms, stem: stem, sentences: sentences, refusalCode: refusalCode };
   }
 
   if (typeof module !== "undefined" && module.exports) { module.exports = { createEngine: createEngine }; }
